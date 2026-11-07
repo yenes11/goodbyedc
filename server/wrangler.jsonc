@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "goodbyedc",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-10-01",
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "Hub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
+  "vars": {
+    // Cloudflare Dashboard > Realtime > SFU uygulamasının App ID'si
+    "REALTIME_APP_ID": "",
+    // Cloudflare Dashboard > Realtime > TURN anahtarının Key ID'si (boş bırakılırsa sadece STUN kullanılır)
+    "TURN_KEY_ID": ""
+  }
+  // Gizli değerler (wrangler secret put ile):
+  //   INVITE_CODE          -> kayıt olmak için davet kodu
+  //   REALTIME_APP_TOKEN   -> SFU uygulamasının API token'ı
+  //   TURN_KEY_TOKEN       -> TURN anahtarının API token'ı (opsiyonel)
+}

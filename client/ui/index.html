@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>goodbyedc</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Giriş ekranı -->
+  <div id="auth" class="auth hidden">
+    <form id="auth-form" class="auth-card">
+      <h1>goodbyedc</h1>
+      <p class="muted" id="auth-sub">Tekrar hoş geldin!</p>
+      <label>Sunucu adresi
+        <input id="auth-url" placeholder="https://goodbyedc.kullanici.workers.dev" required />
+      </label>
+      <label>Kullanıcı adı
+        <input id="auth-user" autocomplete="username" required />
+      </label>
+      <label>Şifre
+        <input id="auth-pass" type="password" autocomplete="current-password" required />
+      </label>
+      <label id="invite-row" class="hidden">Davet kodu
+        <input id="auth-invite" />
+      </label>
+      <div id="auth-error" class="error"></div>
+      <button type="submit" id="auth-submit">Giriş yap</button>
+      <p class="muted small">
+        <span id="auth-toggle-text">Hesabın yok mu?</span>
+        <a href="#" id="auth-toggle">Kayıt ol</a>
+      </p>
+    </form>
+  </div>
+
+  <!-- Ana uygulama -->
+  <div id="app" class="app hidden">
+    <nav id="servers" class="servers"></nav>
+
+    <aside class="sidebar">
+      <header class="server-header">
+        <span id="server-name"></span>
+        <button id="server-delete" class="icon-btn" title="Sunucuyu sil">🗑</button>
+      </header>
+      <div id="channels" class="channels"></div>
+
+      <div id="voice-panel" class="voice-panel hidden">
+        <div>
+          <div class="voice-status">Ses bağlandı</div>
+          <div id="voice-channel-name" class="muted small"></div>
+        </div>
+        <div class="voice-actions">
+          <button id="btn-screen" class="icon-btn" title="Ekran paylaş">🖥</button>
+          <button id="btn-leave" class="icon-btn danger" title="Bağlantıyı kes">📞</button>
+        </div>
+      </div>
+
+      <footer class="user-panel">
+        <div class="avatar" id="me-avatar"></div>
+        <div class="me-name" id="me-name"></div>
+        <button id="btn-mute" class="icon-btn" title="Sustur">🎙</button>
+        <button id="btn-deafen" class="icon-btn" title="Sağırlaştır">🎧</button>
+        <button id="btn-logout" class="icon-btn" title="Çıkış yap">⏻</button>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <header class="channel-header">
+        <span id="channel-title"></span>
+        <span id="conn-status" class="conn-status"></span>
+      </header>
+
+      <section id="chat" class="chat">
+        <div id="messages" class="messages"></div>
+        <form id="composer" class="composer">
+          <input id="composer-input" autocomplete="off" />
+        </form>
+      </section>
+
+      <section id="stage" class="stage hidden">
+        <div class="stage-top">
+          <span id="stage-title"></span>
+          <button id="stage-close" class="btn-secondary">İzlemeyi bırak</button>
+        </div>
+        <canvas id="stage-canvas"></canvas>
+      </section>
+
+      <section id="empty" class="empty hidden">
+        <p class="muted">Bir kanal seç.</p>
+      </section>
+    </main>
+  </div>
+
+  <!-- Modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <h2 id="modal-title"></h2>
+      <div id="modal-body"></div>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn-secondary">Vazgeç</button>
+        <button id="modal-ok">Tamam</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

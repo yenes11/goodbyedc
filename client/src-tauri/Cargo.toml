@@ -1,0 +1,25 @@
+[package]
+name = "goodbyedc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "goodbyedc_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+futures-util = "0.3"
+libwebrtc = "0.4"
+jpeg-encoder = "0.7"
