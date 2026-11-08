@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod api;
+mod appaudio;
 mod app;
 mod backend;
 mod config;

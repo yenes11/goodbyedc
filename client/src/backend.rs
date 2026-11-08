@@ -37,6 +37,8 @@ pub enum Cmd {
     Send(Value),
     Voice(VoiceCmd),
     ScreenSources,
+    /// Ses çalan uygulamaları listele (ses paylaşımı için).
+    AudioApps,
     CheckUpdate { manual: bool },
 }
 
@@ -48,6 +50,8 @@ pub enum VoiceCmd {
     SetDeafened(bool),
     ScreenStart { id: u64, kind: String },
     ScreenStop,
+    MusicStart { pid: u32 },
+    MusicStop,
     ApplyUpdate,
 }
 
@@ -63,6 +67,7 @@ pub enum Event {
     VoiceLeft,
     Tracks(Vec<String>),
     Sources(Vec<SourceInfo>),
+    AudioApps(Vec<crate::appaudio::AppAudio>),
     Update { check: update::Check, manual: bool },
     UpdateFailed,
     Toast { text: String, error: bool },
@@ -165,6 +170,13 @@ async fn main_loop(base: String, mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                         Ok(list) => sink.send(Event::Sources(list)),
                         Err(e) => sink.toast(format!("Ekranlar listelenemedi: {e}"), true),
                     }
+                });
+            }
+            Cmd::AudioApps => {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let list = tokio::task::spawn_blocking(crate::appaudio::list).await.unwrap_or_default();
+                    sink.send(Event::AudioApps(list));
                 });
             }
             Cmd::CheckUpdate { manual } => {
@@ -364,6 +376,20 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
                 let Some(c) = call.as_mut() else { continue };
                 if let Err(e) = c.stop_screen().await {
                     sink.toast(format!("Paylaşım durdurulamadı: {e:#}"), true);
+                }
+                sink.send(Event::Tracks(c.tracks().into_iter().map(String::from).collect()));
+            }
+            VoiceCmd::MusicStart { pid } => {
+                let Some(c) = call.as_mut() else { continue };
+                if let Err(e) = c.start_music(pid).await {
+                    sink.toast(format!("Ses paylaşılamadı: {e:#}"), true);
+                }
+                sink.send(Event::Tracks(c.tracks().into_iter().map(String::from).collect()));
+            }
+            VoiceCmd::MusicStop => {
+                let Some(c) = call.as_mut() else { continue };
+                if let Err(e) = c.stop_music().await {
+                    sink.toast(format!("Ses paylaşımı durdurulamadı: {e:#}"), true);
                 }
                 sink.send(Event::Tracks(c.tracks().into_iter().map(String::from).collect()));
             }

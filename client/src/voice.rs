@@ -12,6 +12,8 @@ use futures_util::StreamExt;
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 use libwebrtc::peer_connection::TrackEvent;
 use libwebrtc::prelude::*;
+use libwebrtc::audio_source::native::NativeAudioSource;
+use libwebrtc::audio_source::AudioSourceOptions;
 use libwebrtc::video_source::native::NativeVideoSource;
 use libwebrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
@@ -77,6 +79,11 @@ impl Default for Gate {
     }
 }
 
+/// Bir oturumun müzik yayınının sahip anahtarı (ses ayarı ve seviyeler için).
+pub fn music_owner(session: &str) -> String {
+    format!("{session}#music")
+}
+
 /// 0..1 seviyeyi dB'ye çevirir (-100..0).
 pub fn level_db(level: f32) -> f32 {
     if level <= 0.00001 {
@@ -130,6 +137,14 @@ pub struct Participant {
     pub tracks: Vec<String>,
 }
 
+/// Paylaşılan uygulama sesi (ör. Spotify).
+struct LocalMusic {
+    _capture: crate::appaudio::Capture,
+    pacer: JoinHandle<()>,
+    transceiver: RtpTransceiver,
+    mid: String,
+}
+
 struct LocalScreen {
     _capture: Capture,
     transceiver: RtpTransceiver,
@@ -143,6 +158,7 @@ pub struct Call {
     pub session_id: String,
     mic: RtcAudioTrack,
     screen: Option<LocalScreen>,
+    music: Option<LocalMusic>,
     /// "oturumId/trackAdı" -> mid
     pulled: HashMap<String, String>,
     /// Son bilinen katılımcılar ve izlenen ekran (başarısız çekmeleri yeniden denemek için).
@@ -228,6 +244,7 @@ impl Call {
             session_id,
             mic: mic.clone(),
             screen: None,
+            music: None,
             pulled: HashMap::new(),
             last_sync: (Vec::new(), None),
             repulled: HashMap::new(),
@@ -300,8 +317,10 @@ impl Call {
             .first()
             .and_then(|t| t.mid.clone())
             .ok_or_else(|| anyhow!("SFU track mid döndürmedi"))?;
-        // on_track tetiklenmeden önce sahibini kaydet.
-        self.shared.mid_owner.lock().insert(mid.clone(), remote_session.to_string());
+        // on_track tetiklenmeden önce sahibini kaydet. Müzik ayrı bir sahip anahtarı alır
+        // ("oturum#music"): konuşma halkasını yakmasın, ses ayarı ayrı olsun.
+        let owner = if track == "music" { music_owner(remote_session) } else { remote_session.to_string() };
+        self.shared.mid_owner.lock().insert(mid.clone(), owner);
         if res.requires_immediate_renegotiation {
             if let Some(offer) = &res.session_description {
                 if let Err(e) = self.answer_offer(offer).await {
@@ -364,6 +383,9 @@ impl Call {
             }
             if p.tracks.iter().any(|t| t == "mic") {
                 desired.insert((p.session_id.clone(), "mic".into()));
+            }
+            if p.tracks.iter().any(|t| t == "music") {
+                desired.insert((p.session_id.clone(), "music".into()));
             }
             if watch == Some(p.session_id.as_str()) && p.tracks.iter().any(|t| t == "screen") {
                 desired.insert((p.session_id.clone(), "screen".into()));
@@ -464,6 +486,102 @@ impl Call {
         let Some(s) = self.screen.take() else { return Ok(()) };
         let LocalScreen { _capture, transceiver, mid } = s;
         drop(_capture);
+        self.stop_local(transceiver, mid).await
+    }
+
+    /// Bir uygulamanın sesini (pid) "music" track'i olarak yayınlar.
+    pub async fn start_music(&mut self, pid: u32) -> Result<()> {
+        use crate::appaudio::{CHANNELS, SAMPLE_RATE};
+        if self.music.is_some() {
+            self.stop_music().await?;
+        }
+        // Yakalanan ses tampona girer; 10 ms'lik dilimler düzenli olarak gönderilir.
+        // Uygulama sustuğunda (duraklatınca) sessizlik gönderilir, böylece yayın kesilmez.
+        let buf = Arc::new(Mutex::new(std::collections::VecDeque::<i16>::new()));
+        let capture = {
+            let buf = buf.clone();
+            crate::appaudio::capture(pid, move |d| {
+                let mut b = buf.lock();
+                b.extend(d.iter().copied());
+                // En fazla 200 ms gecikme: fazlası atılır.
+                let max = (SAMPLE_RATE / 5 * CHANNELS) as usize;
+                if b.len() > max {
+                    let extra = b.len() - max;
+                    b.drain(..extra);
+                }
+            })?
+        };
+        let source = NativeAudioSource::new(
+            AudioSourceOptions { echo_cancellation: false, noise_suppression: false, auto_gain_control: false },
+            SAMPLE_RATE,
+            CHANNELS,
+            0,
+        );
+        let pacer = {
+            let source = source.clone();
+            spawn(async move {
+                let chunk = (SAMPLE_RATE / 100 * CHANNELS) as usize;
+                let mut tick = tokio::time::interval(Duration::from_millis(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+                // Başta biraz biriktir (titremeye karşı).
+                let mut primed = false;
+                loop {
+                    tick.tick().await;
+                    let data: Vec<i16> = {
+                        let mut b = buf.lock();
+                        if !primed && b.len() >= chunk * 4 {
+                            primed = true;
+                        }
+                        if primed && b.len() >= chunk {
+                            b.drain(..chunk).collect()
+                        } else {
+                            if b.is_empty() {
+                                primed = false;
+                            }
+                            vec![0; chunk]
+                        }
+                    };
+                    let frame = AudioFrame {
+                        data: data.into(),
+                        sample_rate: SAMPLE_RATE,
+                        num_channels: CHANNELS,
+                        samples_per_channel: SAMPLE_RATE / 100,
+                    };
+                    let _ = source.capture_frame(&frame).await;
+                }
+            })
+        };
+        let track = self.factory.create_audio_track("music", source);
+        let enc = RtpEncodingParameters { max_bitrate: Some(128_000), ..Default::default() };
+        let tr = match self.add_send_transceiver(MediaStreamTrack::Audio(track), vec![enc]) {
+            Ok(t) => t,
+            Err(e) => {
+                pacer.abort();
+                return Err(e);
+            }
+        };
+        let mid = match self.push_track(&tr, "music").await {
+            Ok(m) => m,
+            Err(e) => {
+                pacer.abort();
+                let _ = tr.stop();
+                return Err(e).context("ses yayını gönderilemedi");
+            }
+        };
+        self.music = Some(LocalMusic { _capture: capture, pacer, transceiver: tr, mid });
+        Ok(())
+    }
+
+    pub async fn stop_music(&mut self) -> Result<()> {
+        let Some(m) = self.music.take() else { return Ok(()) };
+        let LocalMusic { _capture, pacer, transceiver, mid } = m;
+        drop(_capture);
+        pacer.abort();
+        self.stop_local(transceiver, mid).await
+    }
+
+    /// Yerel bir yayını durdurur ve SFU'da kapatır.
+    async fn stop_local(&mut self, transceiver: RtpTransceiver, mid: String) -> Result<()> {
         transceiver.stop().map_err(|e| anyhow!("{e}"))?;
         let offer = self.pc.create_offer(offer_options()).await.map_err(|e| anyhow!("{e}"))?;
         self.pc.set_local_description(offer.clone()).await.map_err(|e| anyhow!("{e}"))?;
@@ -487,16 +605,22 @@ impl Call {
     }
 
     pub fn tracks(&self) -> Vec<&'static str> {
+        let mut t = vec!["mic"];
         if self.screen.is_some() {
-            vec!["mic", "screen"]
-        } else {
-            vec!["mic"]
+            t.push("screen");
         }
+        if self.music.is_some() {
+            t.push("music");
+        }
+        t
     }
 
     pub fn leave(mut self) {
         self.stats_task.abort();
         self.screen = None; // yakalamayı durdurur
+        if let Some(m) = self.music.take() {
+            m.pacer.abort();
+        }
         for (_, h) in self.shared.viewers.lock().drain() {
             h.abort();
         }

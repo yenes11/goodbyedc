@@ -75,6 +75,7 @@ const RTC_BASE = "https://rtc.live.cloudflare.com/v1";
 const AUDIO_BPS = 64_000;
 // Bir izleyiciye giden ekran görüntüsü: istemcideki 3 Mbps tavan + ek yük.
 const SCREEN_BPS = 3_300_000;
+const MUSIC_BPS = 140_000;
 const WINDOW_DAYS = 31;
 const USAGE_TICK_MS = 60_000;
 const LIMIT_MSG = "Son 31 günün ücretsiz trafik sınırına ulaşıldı. Sesli sohbet geçici olarak kapalı.";
@@ -525,6 +526,8 @@ export class Hub extends DurableObject<Env> {
       const same = voice.filter((o) => o.channelId === p.channelId && o.sessionId !== p.sessionId);
       // p, kanaldaki herkesin mikrofonunu çeker.
       bps += same.filter((o) => o.tracks.includes("mic")).length * AUDIO_BPS;
+      // Paylaşılan uygulama sesi (müzik), herkes çeker.
+      bps += same.filter((o) => o.tracks.includes("music")).length * MUSIC_BPS;
       // p birinin ekranını izliyorsa.
       if (p.watching && same.some((o) => o.sessionId === p.watching && o.tracks.includes("screen"))) {
         bps += SCREEN_BPS;
@@ -608,7 +611,7 @@ function dayOffset(days: number): string {
 
 function sanitizeTracks(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
-  return v.filter((t) => t === "mic" || t === "screen");
+  return v.filter((t) => t === "mic" || t === "screen" || t === "music");
 }
 
 function randomHex(bytes: number): string {

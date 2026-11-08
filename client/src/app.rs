@@ -13,9 +13,10 @@ use serde_json::json;
 use crate::api::{Channel, Message, Server, ServerMsg, Usage, User, VoiceUser};
 use crate::backend::{Backend, Cmd, Conn, Event, VoiceCmd};
 use crate::config::Settings;
+use crate::appaudio::{self, AppAudio};
 use crate::screen::SourceInfo;
 use crate::theme::*;
-use crate::voice::{level_db, Gate, Levels, Participant};
+use crate::voice::{level_db, music_owner, Gate, Levels, Participant};
 use crate::widgets::{self, Tone};
 
 /// Üst çubukların yüksekliği (macOS pencere düğmeleri bunun ortasına yerleşir).
@@ -49,6 +50,8 @@ enum Modal {
     DeleteChannel { id: i64, name: String },
     ScreenShare { sources: Option<Vec<SourceInfo>>, tab: SourceTab, selected: Option<String> },
     Settings,
+    /// Uygulama sesi paylaş (ör. Spotify).
+    AudioShare { apps: Option<Vec<AppAudio>>, selected: Option<u32> },
 }
 
 struct AuthForm {
@@ -87,6 +90,8 @@ pub struct App {
     voice_joining: Option<i64>,
     /// Ekran paylaşımı başlatılıyor/durduruluyor.
     screen_busy: bool,
+    /// Ses paylaşımı başlatılıyor/durduruluyor.
+    music_busy: bool,
     watching: Option<String>,
     screen_tex: Option<(String, TextureHandle)>,
     speaking: HashSet<String>,
@@ -153,6 +158,7 @@ impl App {
             my_voice: None,
             voice_joining: None,
             screen_busy: false,
+            music_busy: false,
             watching: None,
             screen_tex: None,
             speaking: HashSet::new(),
@@ -205,6 +211,13 @@ impl App {
                 });
             }
             "toast" => self.toast("Ses kanalına bağlanılıyor…", false),
+            "music" => {
+                let a = |pid, name: &str| AppAudio { pid, name: name.into() };
+                self.modal = Some(Modal::AudioShare {
+                    apps: Some(vec![a(1, "Chrome"), a(2, "Spotify"), a(3, "Steam")]),
+                    selected: Some(2),
+                });
+            }
             "settings" => {
                 self.settings.input_auto = false;
                 self.modal = Some(Modal::Settings);
@@ -249,9 +262,21 @@ impl App {
                 }
                 Event::Tracks(tracks) => {
                     self.screen_busy = false;
+                    self.music_busy = false;
                     if let Some(v) = &mut self.my_voice {
                         v.tracks = tracks.clone();
                         self.ws(json!({ "t": "voice_update", "tracks": tracks }));
+                    }
+                }
+                Event::AudioApps(list) => {
+                    if let Some(Modal::AudioShare { apps, selected }) = &mut self.modal {
+                        // Spotify varsa onu seç, yoksa ilkini.
+                        *selected = list
+                            .iter()
+                            .find(|a| a.name.to_lowercase().contains("spotify"))
+                            .or(list.first())
+                            .map(|a| a.pid);
+                        *apps = Some(list);
                     }
                 }
                 Event::Sources(list) => {
@@ -295,11 +320,16 @@ impl App {
         *self.backend.shared.gate.lock() =
             Gate { auto: self.settings.input_auto, threshold_db: self.settings.input_threshold_db };
         {
-            let vols: HashMap<String, f32> = self
+            let mut vols: HashMap<String, f32> = self
                 .voice
                 .iter()
                 .filter_map(|v| self.settings.user_volumes.get(&v.user_id.to_string()).map(|x| (v.session_id.clone(), *x)))
                 .collect();
+            for v in &self.voice {
+                if let Some(x) = self.settings.user_volumes.get(&format!("music:{}", v.user_id)) {
+                    vols.insert(music_owner(&v.session_id), *x);
+                }
+            }
             *self.backend.shared.volumes.lock() = vols;
         }
 
@@ -472,7 +502,8 @@ impl App {
         self.watching = None;
         self.screen_tex = None;
         self.screen_busy = false;
-        if matches!(self.modal, Some(Modal::ScreenShare { .. })) {
+        self.music_busy = false;
+        if matches!(self.modal, Some(Modal::ScreenShare { .. } | Modal::AudioShare { .. })) {
             self.modal = None;
         }
     }
@@ -551,6 +582,22 @@ impl App {
         } else {
             self.modal = Some(Modal::ScreenShare { sources: None, tab: SourceTab::Screens, selected: None });
             self.backend.send(Cmd::ScreenSources);
+        }
+    }
+
+    fn toggle_music(&mut self) {
+        let Some(v) = &self.my_voice else { return };
+        if self.music_busy {
+            return;
+        }
+        if v.tracks.iter().any(|t| t == "music") {
+            self.music_busy = true;
+            self.backend.voice(VoiceCmd::MusicStop);
+        } else if !appaudio::supported() {
+            self.toast("Uygulama sesi paylaşımı şimdilik yalnızca Windows'ta çalışıyor", false);
+        } else {
+            self.modal = Some(Modal::AudioShare { apps: None, selected: None });
+            self.backend.send(Cmd::AudioApps);
         }
     }
 
@@ -857,9 +904,27 @@ impl App {
                 if r.drag_stopped() || (r.changed() && !r.dragged()) {
                     self.settings.save();
                 }
+                if u.tracks.iter().any(|t| t == "music") {
+                    ui.add_space(8.0);
+                    widgets::section_label(ui, "Paylaşılan ses (müzik)");
+                    let mkey = format!("music:{}", u.user_id);
+                    let mut mv = self.settings.user_volumes.get(&mkey).copied().unwrap_or(1.0) * 100.0;
+                    let r = ui.add(egui::Slider::new(&mut mv, 0.0..=200.0).step_by(1.0).suffix("%").trailing_fill(true));
+                    if r.changed() {
+                        if (mv - 100.0).abs() < 0.5 {
+                            self.settings.user_volumes.remove(&mkey);
+                        } else {
+                            self.settings.user_volumes.insert(mkey.clone(), mv / 100.0);
+                        }
+                    }
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        self.settings.save();
+                    }
+                }
                 ui.add_space(4.0);
                 if ui.button("Varsayılana döndür (%100)").clicked() {
                     self.settings.user_volumes.remove(&key);
+                    self.settings.user_volumes.remove(&format!("music:{}", u.user_id));
                     self.settings.save();
                     ui.close();
                 }
@@ -907,6 +972,13 @@ impl App {
             }
             right = badge.left() - 6.0;
         }
+        if u.tracks.iter().any(|t| t == "music") {
+            let r = egui::Rect::from_center_size(egui::pos2(right - 7.0, rect.center().y), Vec2::splat(16.0));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, ph::MUSIC_NOTES, icon_font(14.0), GREEN);
+            ui.interact(r, ui.id().with(("music", &u.session_id)), Sense::hover())
+                .on_hover_text("Uygulama sesi paylaşıyor. Sesini ayarlamak için adına sağ tıkla.");
+            right -= 20.0;
+        }
         let flag = if u.deafened {
             Some(ph::EAR_SLASH)
         } else if u.muted {
@@ -933,6 +1005,7 @@ impl App {
     fn voice_panel(&mut self, ui: &mut Ui) {
         let Some(v) = &self.my_voice else { return };
         let sharing = v.tracks.iter().any(|t| t == "screen");
+        let music = v.tracks.iter().any(|t| t == "music");
         let ch_name = self.channel(v.channel_id).map(|c| c.name.clone()).unwrap_or_default();
         ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top() - 8.0, Stroke::new(1.0, BORDER));
         ui.horizontal(|ui| {
@@ -951,6 +1024,12 @@ impl App {
                     widgets::spinner_slot(ui, 32.0, if sharing { "Durduruluyor…" } else { "Paylaşım başlatılıyor…" });
                 } else if widgets::icon_button(ui, ph::SCREENCAST, tip, if sharing { Tone::On } else { Tone::Normal }).clicked() {
                     self.toggle_screen_share();
+                }
+                let tip = if music { "Ses paylaşımını durdur" } else { "Uygulama sesi paylaş (Spotify vb.)" };
+                if self.music_busy {
+                    widgets::spinner_slot(ui, 32.0, if music { "Durduruluyor…" } else { "Ses paylaşımı başlatılıyor…" });
+                } else if widgets::icon_button(ui, ph::MUSIC_NOTES, tip, if music { Tone::On } else { Tone::Normal }).clicked() {
+                    self.toggle_music();
                 }
             });
         });
@@ -1227,6 +1306,66 @@ impl App {
                             keep = false;
                         } else {
                             next = Some(Modal::DeleteChannel { id, name });
+                        }
+                    }
+                    Modal::AudioShare { apps, mut selected } => {
+                        ui.label(RichText::new("Uygulama sesi paylaş").font(bold_font(18.0)).color(TEXT_STRONG));
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Seçtiğin uygulamanın sesi ses kanalındaki herkese gider. Yalnızca o uygulamanın sesi paylaşılır.")
+                                .size(12.5)
+                                .color(MUTED),
+                        );
+                        ui.add_space(10.0);
+                        let mut share_now = false;
+                        ScrollArea::vertical().max_height(260.0).min_scrolled_height(260.0).auto_shrink([false, false]).show(ui, |ui| {
+                            match &apps {
+                                None => widgets::loading_center(ui, "Ses çalan uygulamalar aranıyor…"),
+                                Some(list) if list.is_empty() => {
+                                    ui.add_space(20.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(RichText::new("Ses çalan uygulama bulunamadı.").color(MUTED));
+                                        ui.label(RichText::new("Spotify'da bir şarkı başlatıp tekrar dene.").size(12.5).color(MUTED));
+                                    });
+                                }
+                                Some(list) => {
+                                    for a in list {
+                                        let is_sel = selected == Some(a.pid);
+                                        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), Sense::click());
+                                        let bg = if is_sel { BG_ELEV } else if r.hovered() { HOVER } else { BG_MAIN };
+                                        let stroke = if is_sel { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, BG_MAIN) };
+                                        ui.painter().rect(rect.shrink(1.0), CornerRadius::same(8), bg, stroke, StrokeKind::Inside);
+                                        ui.painter().text(egui::pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, ph::MUSIC_NOTES, icon_font(17.0), MUTED);
+                                        ui.painter().text(egui::pos2(rect.left() + 40.0, rect.center().y), Align2::LEFT_CENTER, truncate(&a.name, 52), font(13.5), TEXT_STRONG);
+                                        if r.clicked() {
+                                            selected = Some(a.pid);
+                                        }
+                                        if r.double_clicked() {
+                                            selected = Some(a.pid);
+                                            share_now = true;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("İpucu: hoparlör kullanıyorsan müzik mikrofonuna da girebilir; kulaklık en iyisi.")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(12.0);
+                        let (cancel, ok) = modal_buttons(ui, "Paylaş", selected.is_some());
+                        if cancel {
+                            keep = false;
+                        } else if (ok || share_now) && selected.is_some() {
+                            if let Some(pid) = selected {
+                                self.music_busy = true;
+                                self.backend.voice(VoiceCmd::MusicStart { pid });
+                            }
+                            keep = false;
+                        } else {
+                            next = Some(Modal::AudioShare { apps, selected });
                         }
                     }
                     Modal::Settings => {
