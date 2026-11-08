@@ -3,7 +3,7 @@
 # exe kendini guncelleyemez; sadece deneme icin kullan.
 # Calistirmak icin: windows-kur.bat dosyasina cift tikla.
 $ErrorActionPreference = "Continue"
-Set-Location -Path (Join-Path $PSScriptRoot "src-tauri")
+Set-Location -Path $PSScriptRoot
 
 function Adim($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
 function Var($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
@@ -32,14 +32,6 @@ if (-not (Var cargo)) {
 }
 rustup default stable-msvc
 cargo --version
-
-# 3) Tauri CLI
-Adim "Tauri CLI kontrol ediliyor"
-$null = cmd /c "cargo tauri --version 2>nul"
-if ($LASTEXITCODE -ne 0) {
-  Write-Host "Kuruluyor (birkac dakika)..."
-  cargo install tauri-cli --version "^2" --locked
-}
 
 # 3.5) WebRTC kutuphanesini kendimiz indir (derleme sirasindaki indirme zaman asimina ugrayabiliyor)
 Adim "WebRTC kutuphanesi kontrol ediliyor"
@@ -78,7 +70,7 @@ Write-Host "Tamam: $env:LK_CUSTOM_WEBRTC"
 
 # 4) Derle (kurulum dosyasi yok, tek basina calisan exe)
 Adim "Uygulama derleniyor (ilk seferde 10-20 dakika surebilir)"
-cargo tauri build --no-bundle
+cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "Derleme basarisiz oldu." }
 
 # 5) Exe'yi disari kopyala

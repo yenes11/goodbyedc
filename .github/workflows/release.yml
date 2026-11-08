@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: client/src-tauri
+        working-directory: client
     steps:
       - uses: actions/checkout@v4
 
@@ -31,22 +31,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: client/src-tauri
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+          workspaces: client
 
       - name: Derle
         shell: bash
-        run: npx --yes @tauri-apps/cli@2 build --no-bundle
+        run: cargo build --release
 
       - name: Dosyaları hazırla
         shell: bash
         run: |
-          mkdir -p ../../dist
-          cp target/release/goodbyedc.exe ../../dist/goodbyedc-windows-x86_64.exe
-          cd ../../dist
+          mkdir -p ../dist
+          cp target/release/goodbyedc.exe ../dist/goodbyedc-windows-x86_64.exe
+          cd ../dist
           sha256sum goodbyedc-windows-x86_64.exe | cut -d' ' -f1 > goodbyedc-windows-x86_64.exe.sha256
           cat goodbyedc-windows-x86_64.exe.sha256
           ls -la

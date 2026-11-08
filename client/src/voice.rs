@@ -17,14 +17,29 @@ use libwebrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::json;
-use tauri::async_runtime::JoinHandle;
-use tauri::ipc::{Channel, InvokeResponseBody};
+use tokio::task::JoinHandle;
 
 use crate::screen::{self, Capture};
 use crate::sfu::{Sdp, Sfu};
 
-/// Ekran izlerken arayüze gönderilen en yüksek kare hızı.
+/// Ekran izlerken arayüze aktarılan en yüksek kare hızı.
 const VIEW_FPS: u64 = 30;
+
+/// İzlenen ekranın son karesi.
+pub struct ScreenFrame {
+    /// Ekranı paylaşanın oturum id'si.
+    pub owner: String,
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+}
+
+/// Ses seviyeleri (0..1): kendi mikrofonumuz ve oturum id'sine göre diğerleri.
+#[derive(Default, Clone)]
+pub struct Levels {
+    pub me: f32,
+    pub peers: HashMap<String, f32>,
+}
 
 /// Call ile paylaşılan, WebRTC callback'lerinden de erişilen durum.
 #[derive(Default)]
@@ -34,10 +49,20 @@ pub struct Shared {
     pub mid_owner: Mutex<HashMap<String, String>>,
     /// mid -> ekran izleme görevi
     pub viewers: Mutex<HashMap<String, JoinHandle<()>>>,
-    /// Arayüze JPEG kareleri gönderen kanal.
-    pub frame_sink: Mutex<Option<Channel<InvokeResponseBody>>>,
-    /// Arayüze ses seviyelerini (kim konuşuyor) gönderen kanal.
-    pub level_sink: Mutex<Option<Channel<serde_json::Value>>>,
+    /// İzlenen ekranın son karesi (arayüz alıp dokuya çevirir).
+    pub frame: Mutex<Option<ScreenFrame>>,
+    /// Son ölçülen ses seviyeleri.
+    pub levels: Mutex<Levels>,
+    /// Yeni veri gelince arayüzü yeniden çizdirmek için.
+    pub repaint: Mutex<Option<eframe::egui::Context>>,
+}
+
+impl Shared {
+    pub fn request_repaint(&self) {
+        if let Some(ctx) = self.repaint.lock().as_ref() {
+            ctx.request_repaint();
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -112,7 +137,7 @@ impl Call {
         let mic = factory.create_device_audio_track("mic");
         mic.set_enabled(!muted);
 
-        let stats_task = tauri::async_runtime::spawn(stats_loop(pc.clone(), shared.clone()));
+        let stats_task = tokio::spawn(stats_loop(pc.clone(), shared.clone()));
         let call = Self {
             sfu,
             factory,
@@ -323,6 +348,9 @@ impl Call {
             h.abort();
         }
         self.shared.mid_owner.lock().clear();
+        *self.shared.frame.lock() = None;
+        *self.shared.levels.lock() = Levels::default();
+        self.shared.request_repaint();
         self.pc.close();
         self.factory.release_platform_adm();
     }
@@ -340,7 +368,7 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
         MediaStreamTrack::Video(t) => {
             let owner = shared.mid_owner.lock().get(&mid).cloned().unwrap_or_default();
             let shared2 = shared.clone();
-            let handle = tauri::async_runtime::spawn(view_screen(shared2, owner, t));
+            let handle = tokio::spawn(view_screen(shared2, owner, t));
             if let Some(old) = shared.viewers.lock().insert(mid, handle) {
                 old.abort();
             }
@@ -348,8 +376,7 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
     }
 }
 
-/// Uzak ekran görüntüsünü JPEG'e çevirip arayüze gönderir.
-/// Paket formatı: [1 bayt id uzunluğu][oturum id][JPEG verisi]
+/// Uzak ekran görüntüsünü RGBA'ya çevirip arayüze bırakır.
 async fn view_screen(shared: Arc<Shared>, owner: String, track: RtcVideoTrack) {
     let mut stream = NativeVideoStream::new(track);
     let min_gap = Duration::from_millis(1000 / VIEW_FPS);
@@ -359,15 +386,10 @@ async fn view_screen(shared: Arc<Shared>, owner: String, track: RtcVideoTrack) {
             continue;
         }
         last = Instant::now();
-        let Some(sink) = shared.frame_sink.lock().clone() else { continue };
-        let jpeg = tokio::task::spawn_blocking(move || screen::frame_to_jpeg(&frame)).await;
-        let Ok(Some(jpeg)) = jpeg else { continue };
-        let id = owner.as_bytes();
-        let mut payload = Vec::with_capacity(1 + id.len() + jpeg.len());
-        payload.push(id.len() as u8);
-        payload.extend_from_slice(id);
-        payload.extend_from_slice(&jpeg);
-        let _ = sink.send(InvokeResponseBody::Raw(payload));
+        let converted = tokio::task::spawn_blocking(move || screen::frame_to_rgba(&frame)).await;
+        let Ok(Some((width, height, rgba))) = converted else { continue };
+        *shared.frame.lock() = Some(ScreenFrame { owner: owner.clone(), width, height, rgba });
+        shared.request_repaint();
     }
 }
 
@@ -414,8 +436,11 @@ async fn stats_loop(pc: PeerConnection, shared: Arc<Shared>) {
         if tick % 20 == 0 {
             log::info!("ses: mikrofon seviyesi {me:.3}, gönderilen {sent} B, alınan {recv:?}, seviyeler {peers:?}");
         }
-        if let Some(sink) = shared.level_sink.lock().clone() {
-            let _ = sink.send(json!({ "me": me, "peers": peers, "sent": sent, "recv": recv }));
+        {
+            let mut lv = shared.levels.lock();
+            lv.me = me as f32;
+            lv.peers = peers.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect();
         }
+        shared.request_repaint();
     }
 }

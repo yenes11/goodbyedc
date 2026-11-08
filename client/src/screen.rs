@@ -15,6 +15,7 @@ use libwebrtc::prelude::*;
 use libwebrtc::video_source::native::NativeVideoSource;
 use serde::Serialize;
 
+
 /// Gönderilen görüntünün en büyük genişliği (1080p).
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
@@ -150,10 +151,11 @@ fn push_frame(video: &NativeVideoSource, frame: &DesktopFrame, start: Instant) {
 }
 
 /// Gelen bir video karesini JPEG'e çevirir (arayüzde göstermek için).
-pub fn frame_to_jpeg(frame: &BoxVideoFrame) -> Option<Vec<u8>> {
+/// Uzak ekran karesini RGBA piksellere çevirir (arayüzde doku olarak çizilir).
+pub fn frame_to_rgba(frame: &BoxVideoFrame) -> Option<(usize, usize, Vec<u8>)> {
     let i420 = frame.buffer.to_i420();
     let (w, h) = (i420.width(), i420.height());
-    if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
+    if w == 0 || h == 0 {
         return None;
     }
     let (sy, su, sv) = i420.strides();
@@ -161,9 +163,5 @@ pub fn frame_to_jpeg(frame: &BoxVideoFrame) -> Option<Vec<u8>> {
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     // libyuv "ABGR" = bellekte R,G,B,A sırası.
     yuv_helper::i420_to_abgr(y, sy, u, su, v, sv, &mut rgba, w * 4, w as i32, h as i32);
-
-    let mut out = Vec::with_capacity((w * h / 4) as usize);
-    let enc = jpeg_encoder::Encoder::new(&mut out, 80);
-    enc.encode(&rgba, w as u16, h as u16, jpeg_encoder::ColorType::Rgba).ok()?;
-    Some(out)
+    Some((w as usize, h as usize, rgba))
 }

@@ -3,8 +3,8 @@
 Arkadaş grubu için küçük ve ücretsiz bir Discord alternatifi. Sadece **yazı**, **ses** ve **ekran paylaşımı** var.
 
 ```
-┌────────── Masaüstü istemci (Rust + Tauri 2) ──────────┐
-│  arayüz: client/ui   |   ses/ekran: libwebrtc (Rust)  │
+┌──────────── Masaüstü istemci (tamamı Rust) ───────────┐
+│  arayüz: egui (native) | ses/ekran: libwebrtc         │
 └──────┬───────────────────────────────┬────────────────┘
        │ WebSocket (yazı + durum)      │ WebRTC (ses/video)
 ┌──────▼───────────────────┐   ┌───────▼────────────────────┐
@@ -17,8 +17,7 @@ Arkadaş grubu için küçük ve ücretsiz bir Discord alternatifi. Sadece **yaz
 | Klasör | İçerik |
 |---|---|
 | `server/` | Cloudflare Worker (TypeScript). Kullanıcılar, sunucular, kanallar, mesajlar ve SFU proxy'si |
-| `client/src-tauri/` | Rust masaüstü uygulaması. Ses (mikrofon/hoparlör, yankı engelleme), ekran yakalama, WebRTC |
-| `client/ui/` | Arayüz (saf HTML/CSS/JS, build adımı yok) |
+| `client/` | Rust masaüstü uygulaması. Arayüz egui ile native çizilir (web görüntüleyici yok). Ses (mikrofon/hoparlör, yankı engelleme), ekran yakalama, WebRTC, kendini güncelleme |
 
 ---
 
@@ -46,7 +45,7 @@ npx wrangler secret put TURN_KEY_TOKEN       # TURN kullanmıyorsan atla
 npx wrangler deploy
 ```
 
-Komut sana `https://goodbyedc.<hesabın>.workers.dev` gibi bir adres verir. Uygulamada **Sunucu adresi** alanına bu adres yazılır.
+Komut sana `https://goodbyedc.<hesabın>.workers.dev` gibi bir adres verir. Bu adres `client/src/config.rs` içinde sabit yazılıdır.
 
 Yerelde denemek için `.dev.vars.example` dosyasını `.dev.vars` olarak kopyala, değerleri doldur ve `npm run dev` çalıştır. Adres `http://127.0.0.1:8787` olur.
 
@@ -56,21 +55,19 @@ Gerekenler: [Rust](https://rustup.rs). macOS'ta Xcode Command Line Tools, Window
 İlk derleme, hazır WebRTC kütüphanesini indirdiği için birkaç dakika sürer.
 
 ```bash
-cd client/src-tauri
+cd client
 cargo run                 # geliştirme modunda çalıştır
+cargo build --release     # tek dosyalık uygulama: target/release/goodbyedc(.exe)
 ```
 
-Arkadaşlarına dağıtılacak kurulum dosyası için:
+**Windows sürümü otomatik:** `main` dalına `client/` içinde bir değişiklik push'lanınca GitHub Actions
+Windows exe'sini derler ve en son sürüm (latest release) olarak yayınlar. Uygulamadaki
+**Güncellemeleri denetle** düğmesi bu sürümü indirip kendini günceller. Sadece GitHub'da derlenen
+exe'ler kendini günceller; elle derlenenler güncelleme aramaz.
 
-```bash
-cargo install tauri-cli --version "^2"
-cd client/src-tauri
-cargo tauri icon icons/icon.png   # tüm platform ikonlarını üretir (bir kez)
-cargo tauri build                 # macOS: .dmg / Windows: .msi + .exe / Linux: .deb + .AppImage
-```
-
-Çıktılar `client/src-tauri/target/release/bundle/` klasörüne düşer. Her işletim sistemi için o sistemde derlemek gerekir.
 İmzasız uygulamalarda macOS'ta ilk açılışta *sağ tık → Aç*, Windows'ta ise SmartScreen uyarısında *Yine de çalıştır* demek gerekir.
+
+Geliştirme için ortam değişkenleri: `GOODBYEDC_SERVER` (başka sunucu), `GOODBYEDC_CONFIG_DIR` (ayar klasörü).
 
 ### İzinler
 - **macOS:** İlk ses bağlantısında mikrofon izni sorulur. Ekran paylaşımı için *Sistem Ayarları → Gizlilik ve Güvenlik → Ekran Kaydı* altında uygulamaya izin ver, sonra uygulamayı yeniden başlat.
@@ -79,15 +76,16 @@ cargo tauri build                 # macOS: .dmg / Windows: .msi + .exe / Linux: 
 ---
 
 ## Nasıl kullanılır
-- İlk girişte **Kayıt ol** seç, sunucu adresini ve davet kodunu gir.
-- Soldaki **+** ile sunucu, kanal başlıklarının yanındaki **+** ile kanal eklenir.
-- Bir **ses kanalına** tıklayınca bağlanırsın. Alttaki 🎙 susturur, 🎧 sağırlaştırır.
-- 🖥 ekran paylaşımını başlatır. Paylaşan kişinin yanında **CANLI** yazar; ona tıklayınca ekranını izlersin.
+- İlk girişte **Kayıt ol** seç ve davet kodunu gir.
+- Kanal başlıklarının yanındaki **+** ile kanal eklenir.
+- Bir **ses kanalına** tıklayınca bağlanırsın. Alttaki mikrofon düğmesi susturur, kulaklık sağırlaştırır.
+- Ses panelindeki ekran düğmesi paylaşımı başlatır. Paylaşan kişinin yanında **CANLI** yazar; ona tıklayınca ekranını izlersin.
   Görüntü sadece izleyenlere gönderilir, böylece bant genişliği boşa harcanmaz.
 
 ## Teknik notlar
 - Bütün veriler tek bir Durable Object'teki SQLite veritabanında durur. Ücretsiz plan 5 GB depolama sağlıyor, bu da yıllarca yetecek kadar mesaj demek.
 - SFU App Token'ı istemciye hiç gönderilmez. İstemci `/api/rtc/*` üzerinden Worker'a istek atar, Worker oturumun o kullanıcıya ait olduğunu doğrulayıp isteği Cloudflare'e iletir.
 - Ses, libwebrtc'nin platform ses modülüyle çalışır: yankı engelleme, gürültü bastırma ve otomatik kazanç dahil.
-- Ekran paylaşımı en fazla 1080p/30fps ve 3 Mbps. Ayarlar `client/src-tauri/src/screen.rs` ve `voice.rs` içinde.
-- İzlenen ekran, Rust tarafında JPEG'e çevrilip arayüze gönderilir ve `<canvas>`'a çizilir.
+- Ekran paylaşımı en fazla 1080p/30fps ve 3 Mbps. Ayarlar `client/src/screen.rs` ve `voice.rs` içinde.
+- İzlenen ekran RGBA'ya çevrilip doğrudan GPU dokusu olarak çizilir.
+- Ayarlar (giriş, susturma, son kanal) macOS'ta `~/Library/Application Support/goodbyedc/`, Windows'ta `%APPDATA%\goodbyedc\` altında tutulur.
