@@ -1,7 +1,8 @@
 //! Renkler, yazı tipleri ve egui görünüm ayarları.
 
 use eframe::egui::{
-    self, epaint::text::VariationCoords, Color32, CornerRadius, FontData, FontDefinitions, FontFamily,
+    self,
+    epaint::text::{HintingTarget, SmoothHinting, VariationCoords}, Color32, CornerRadius, FontData, FontDefinitions, FontFamily,
     FontId, Margin, Shadow, Stroke, TextStyle,
 };
 
@@ -37,8 +38,10 @@ pub fn bold_font(size: f32) -> FontId {
     FontId::new(size, bold())
 }
 
+/// İkonlar için ayrı aile: Inter, Phosphor'un kullandığı özel kod noktalarında
+/// kendi harflerini taşıdığı için ikonlar normal ailede yanlış görünüyordu.
 pub fn icon_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Proportional)
+    FontId::new(size, FontFamily::Name("icons".into()))
 }
 
 /// Avatar rengi: kullanıcı adından sabit bir renk.
@@ -57,55 +60,37 @@ pub fn avatar_color(name: &str) -> Color32 {
     COLORS[(h % COLORS.len() as u32) as usize]
 }
 
-/// Sistem yazı tipini yükler (macOS: SF Pro, Windows: Segoe UI). Bulamazsa egui'nin
-/// kendi yazı tipi kullanılır. İkonlar Phosphor ikon yazı tipinden gelir.
+/// Yazı tiplerini yükler. macOS'ta sistem yazı tipi (SF Pro) keskin göründüğü için
+/// o kullanılır; Windows/Linux'ta uygulamaya gömülü Inter kullanılır (Segoe UI'nin
+/// satır ölçüleri yazıları dikey olarak kaydırıyordu). İkonlar Phosphor'dan gelir.
+///
+/// `GOODBYEDC_FONT=inter` macOS'ta da Inter'i dener.
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
-    // (yol, kalın sürüm yolu). Değişken yazı tiplerinde kalınlık "wght" ekseniyle seçilir.
-    let candidates: &[(&str, Option<&str>)] = &[
-        ("/System/Library/Fonts/SFNS.ttf", None),
-        ("C:\\Windows\\Fonts\\SegUIVar.ttf", None),
-        ("C:\\Windows\\Fonts\\segoeui.ttf", Some("C:\\Windows\\Fonts\\seguisb.ttf")),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Some("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
-    ];
-    let mut regular_name = None;
-    let mut bold_name = None;
-    for (path, bold_path) in candidates {
-        let Ok(data) = std::fs::read(path) else { continue };
-        match bold_path {
-            None => {
-                // Değişken yazı tipi: aynı dosyadan iki kalınlık.
-                let mut reg = FontData::from_owned(data.clone());
-                reg.tweak.coords = VariationCoords::new([("wght", 400.0)]);
-                let mut bol = FontData::from_owned(data);
-                bol.tweak.coords = VariationCoords::new([("wght", 640.0)]);
-                fonts.font_data.insert("system".into(), reg.into());
-                fonts.font_data.insert("system-bold".into(), bol.into());
-            }
-            Some(bp) => {
-                fonts.font_data.insert("system".into(), FontData::from_owned(data).into());
-                if let Ok(b) = std::fs::read(bp) {
-                    fonts.font_data.insert("system-bold".into(), FontData::from_owned(b).into());
-                }
-            }
+    let force_inter = std::env::var("GOODBYEDC_FONT").is_ok_and(|v| v == "inter");
+    let sf = if cfg!(target_os = "macos") && !force_inter { std::fs::read("/System/Library/Fonts/SFNS.ttf").ok() } else { None };
+    match sf {
+        Some(data) => {
+            // Değişken yazı tipi: aynı dosyadan iki kalınlık.
+            let mut reg = FontData::from_owned(data.clone());
+            reg.tweak.coords = VariationCoords::new([("wght", 400.0)]);
+            let mut bol = FontData::from_owned(data);
+            bol.tweak.coords = VariationCoords::new([("wght", 640.0)]);
+            fonts.font_data.insert("ui".into(), reg.into());
+            fonts.font_data.insert("ui-bold".into(), bol.into());
         }
-        regular_name = Some("system".to_string());
-        if fonts.font_data.contains_key("system-bold") {
-            bold_name = Some("system-bold".to_string());
+        None => {
+            fonts.font_data.insert("ui".into(), crisp(FontData::from_static(include_bytes!("../fonts/Inter-Regular.ttf"))).into());
+            fonts.font_data.insert("ui-bold".into(), crisp(FontData::from_static(include_bytes!("../fonts/Inter-SemiBold.ttf"))).into());
         }
-        break;
     }
 
     let prop = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let mut regular = prop.clone();
-    if let Some(n) = &regular_name {
-        regular.insert(0, n.clone());
-    }
+    regular.insert(0, "ui".into());
     let mut boldf = prop;
-    if let Some(n) = bold_name.or(regular_name) {
-        boldf.insert(0, n);
-    }
+    boldf.insert(0, "ui-bold".into());
     fonts.families.insert(FontFamily::Proportional, regular);
     fonts.families.insert(bold(), boldf);
 
@@ -120,7 +105,19 @@ pub fn setup_fonts(ctx: &egui::Context) {
             f.push(icon);
         }
     }
+    if let Some(icon) = fonts.families.get(&bold()).and_then(|f| f.iter().find(|n| n.contains("phosphor")).cloned()) {
+        fonts.families.insert(FontFamily::Name("icons".into()), vec![icon, "ui".into()]);
+    }
     ctx.set_fonts(fonts);
+}
+
+/// Düşük DPI ekranlarda (Windows) keskin yazı: harf kenarlarını piksellere oturt.
+fn crisp(mut f: FontData) -> FontData {
+    f.tweak.hinting = Some(true);
+    f.tweak.subpixel_binning = Some(false);
+    f.tweak.hinting_target =
+        HintingTarget::Smooth(SmoothHinting { light: false, symmetric_rendering: false, preserve_linear_metrics: false });
+    f
 }
 
 pub fn setup_style(ctx: &egui::Context) {

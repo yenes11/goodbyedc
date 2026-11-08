@@ -15,7 +15,7 @@ pub fn server_url() -> String {
         .to_string()
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
     #[serde(default)]
     pub token: Option<String>,
@@ -28,6 +28,38 @@ pub struct Settings {
     pub last_channel: HashMap<String, i64>,
     #[serde(default)]
     pub last_server: Option<i64>,
+    /// Giriş hassasiyeti otomatik mi?
+    #[serde(default = "yes")]
+    pub input_auto: bool,
+    /// Elle ayarlanan giriş eşiği (dB).
+    #[serde(default = "default_threshold")]
+    pub input_threshold_db: f32,
+    /// Kullanıcı id'si -> ses yüksekliği (0..2, 1 = %100).
+    #[serde(default)]
+    pub user_volumes: HashMap<String, f32>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            token: None,
+            muted: false,
+            deafened: false,
+            last_channel: HashMap::new(),
+            last_server: None,
+            input_auto: true,
+            input_threshold_db: default_threshold(),
+            user_volumes: HashMap::new(),
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_threshold() -> f32 {
+    -45.0
 }
 
 fn path() -> Option<PathBuf> {

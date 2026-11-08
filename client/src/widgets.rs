@@ -48,23 +48,85 @@ pub fn small_icon_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
     resp.on_hover_text(tooltip)
 }
 
-/// Mavi ana düğme.
-pub fn accent_button(ui: &mut Ui, text: &str, width: f32, enabled: bool) -> Response {
+/// Mavi ana düğme. `loading` iken yanında dönen gösterge çıkar ve tıklanamaz.
+pub fn accent_button(ui: &mut Ui, text: &str, width: f32, enabled: bool, loading: bool) -> Response {
     let height = 36.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), if enabled { Sense::click() } else { Sense::hover() });
+    let clickable = enabled && !loading;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), if clickable { Sense::click() } else { Sense::hover() });
     let bg = if !enabled {
         ACCENT.gamma_multiply(0.45)
+    } else if loading {
+        ACCENT.gamma_multiply(0.8)
     } else if resp.hovered() {
         ACCENT_HOVER
     } else {
         ACCENT
     };
     ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, bold_font(14.0), Color32::WHITE);
-    if enabled && resp.hovered() {
+    label_with_spinner(ui, rect, text, bold_font(14.0), Color32::WHITE, loading);
+    if clickable && resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+/// Yazıyı alanın ortasına çizer; `loading` ise solunda küçük dönen gösterge olur.
+fn label_with_spinner(ui: &Ui, rect: Rect, text: &str, font: egui::FontId, color: Color32, loading: bool) {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let gap = if loading { 14.0 + 8.0 } else { 0.0 };
+    let total = galley.size().x + gap;
+    let left = rect.center().x - total / 2.0;
+    if loading {
+        let r = Rect::from_center_size(egui::pos2(left + 7.0, rect.center().y), Vec2::splat(14.0));
+        spin(ui, r, color);
+    }
+    ui.painter().galley(egui::pos2(left + gap, rect.center().y - galley.size().y / 2.0), galley, color);
+}
+
+/// Dönen gösterge: soluk bir halka üzerinde sabit uzunlukta dönen yay.
+pub fn spin(ui: &Ui, rect: Rect, color: Color32) {
+    ui.ctx().request_repaint();
+    let r = rect.width().min(rect.height()) / 2.0 - 1.5;
+    let w = (r * 0.28).clamp(1.5, 3.0);
+    let c = rect.center();
+    ui.painter().circle_stroke(c, r, Stroke::new(w, color.gamma_multiply(0.2)));
+    let t = ui.input(|i| i.time) as f32;
+    let start = t * std::f32::consts::TAU * 1.1;
+    let n = 24;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = start + (i as f32 / n as f32) * std::f32::consts::FRAC_PI_2 * 1.4;
+            c + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(pts, Stroke::new(w, color)));
+}
+
+/// Yerleşimde yer kaplayan dönen gösterge.
+pub fn spinner(ui: &mut Ui, size: f32, color: Color32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    spin(ui, rect, color);
+    resp
+}
+
+/// Dönen gösterge, düğme boyutunda bir yuvada (ikon düğmesinin yerine).
+pub fn spinner_slot(ui: &mut Ui, size: f32, tooltip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    spin(ui, Rect::from_center_size(rect.center(), Vec2::splat(16.0)), MUTED);
+    resp.on_hover_text(tooltip)
+}
+
+/// Kullanılabilir alanın ortasında dönen gösterge ve altında açıklama.
+pub fn loading_center(ui: &mut Ui, text: &str) {
+    let rect = ui.available_rect_before_wrap();
+    paint_loading(ui, rect, text);
+    ui.allocate_rect(rect, Sense::hover());
+}
+
+pub fn paint_loading(ui: &Ui, rect: Rect, text: &str) {
+    let c = rect.center();
+    spin(ui, Rect::from_center_size(egui::pos2(c.x, c.y - 14.0), Vec2::splat(26.0)), ACCENT);
+    ui.painter().text(egui::pos2(c.x, c.y + 18.0), Align2::CENTER_CENTER, text, font(13.5), MUTED);
 }
 
 /// Gri ikincil düğme.
@@ -76,20 +138,21 @@ pub fn secondary_button(ui: &mut Ui, text: &str, width: f32) -> Response {
     resp
 }
 
-/// Yuvarlak "hap" düğme (Güncelle gibi).
-pub fn pill_button(ui: &mut Ui, text: &str, enabled: bool) -> Response {
+/// Yuvarlak "hap" düğme (Güncelle gibi). `loading` iken içinde dönen gösterge olur.
+pub fn pill_button(ui: &mut Ui, text: &str, loading: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), bold_font(13.0), Color32::WHITE);
-    let size = egui::vec2(galley.size().x + 26.0, 26.0);
-    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
-    let bg = if !enabled {
-        ACCENT.gamma_multiply(0.5)
+    let extra = if loading { 20.0 } else { 0.0 };
+    let size = egui::vec2(galley.size().x + 26.0 + extra, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, if loading { Sense::hover() } else { Sense::click() });
+    let bg = if loading {
+        ACCENT.gamma_multiply(0.7)
     } else if resp.hovered() {
         ACCENT_HOVER
     } else {
         ACCENT
     };
     ui.painter().rect_filled(rect, CornerRadius::same(13), bg);
-    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    label_with_spinner(ui, rect, text, bold_font(13.0), Color32::WHITE, loading);
     resp
 }
 
@@ -195,5 +258,66 @@ pub fn enter_pressed(ui: &Ui, resp: &Response) -> bool {
 
 /// Küçük, kalın, büyük harfli başlık ("METİN KANALLARI").
 pub fn section_label(ui: &mut Ui, text: &str) {
-    ui.label(egui::RichText::new(text.to_uppercase()).font(bold_font(11.5)).color(MUTED));
+    ui.label(egui::RichText::new(text.replace('i', "İ").to_uppercase()).font(bold_font(11.5)).color(MUTED));
+}
+
+/// Açma/kapama anahtarı.
+pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(38.0, 22.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let bg = if *on { ACCENT } else { ACTIVE };
+    ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
+    let x = egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, Color32::WHITE);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// Discord'daki gibi giriş hassasiyeti çubuğu: anlık mikrofon seviyesi ve
+/// sürüklenebilir eşik. Değerler dB (-100..0).
+pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, editable: bool) -> Response {
+    let (rect, mut resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), if editable { Sense::click_and_drag() } else { Sense::hover() });
+    let to_x = |db: f32| egui::lerp(rect.left()..=rect.right(), (db + 100.0) / 100.0);
+    if editable {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let t = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let v = (t * 100.0 - 100.0).round();
+            if v != *threshold_db {
+                *threshold_db = v;
+                resp.mark_changed();
+            }
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+    let bar = Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 10.0));
+    let p = ui.painter();
+    let tx = to_x(*threshold_db).clamp(bar.left(), bar.right());
+    let amber = Color32::from_rgb(0xd8, 0xa3, 0x3a);
+    // Eşiğin solu (iletilmez) sarı, sağı (iletilir) yeşil; soluk zemin.
+    p.rect_filled(Rect::from_min_max(bar.min, egui::pos2(tx, bar.max.y)), CornerRadius::same(5), amber.gamma_multiply(0.25));
+    p.rect_filled(Rect::from_min_max(egui::pos2(tx, bar.min.y), bar.max), CornerRadius::same(5), GREEN.gamma_multiply(0.25));
+    // Anlık seviye
+    let lx = to_x(level_db).clamp(bar.left(), bar.right());
+    if lx > bar.left() + 1.0 {
+        let left_end = lx.min(tx);
+        p.rect_filled(Rect::from_min_max(bar.min, egui::pos2(left_end, bar.max.y)), CornerRadius::same(5), amber);
+        if lx > tx {
+            p.rect_filled(Rect::from_min_max(egui::pos2(tx, bar.min.y), egui::pos2(lx, bar.max.y)), CornerRadius::same(5), GREEN);
+        }
+    }
+    // Eşik tutamacı
+    let handle = Rect::from_center_size(egui::pos2(tx, rect.center().y), egui::vec2(6.0, 22.0));
+    let hc = if editable { Color32::WHITE } else { MUTED };
+    p.rect_filled(handle, CornerRadius::same(3), hc);
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    resp
 }

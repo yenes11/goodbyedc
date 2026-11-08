@@ -15,7 +15,7 @@ use crate::backend::{Backend, Cmd, Conn, Event, VoiceCmd};
 use crate::config::Settings;
 use crate::screen::SourceInfo;
 use crate::theme::*;
-use crate::voice::Participant;
+use crate::voice::{level_db, Gate, Levels, Participant};
 use crate::widgets::{self, Tone};
 
 /// Üst çubukların yüksekliği (macOS pencere düğmeleri bunun ortasına yerleşir).
@@ -48,6 +48,7 @@ enum Modal {
     CreateChannel { kind: &'static str, name: String },
     DeleteChannel { id: i64, name: String },
     ScreenShare { sources: Option<Vec<SourceInfo>>, tab: SourceTab, selected: Option<String> },
+    Settings,
 }
 
 struct AuthForm {
@@ -82,10 +83,15 @@ pub struct App {
     composer: String,
 
     my_voice: Option<MyVoice>,
-    voice_busy: bool,
+    /// Bağlanılmakta olan ses kanalı.
+    voice_joining: Option<i64>,
+    /// Ekran paylaşımı başlatılıyor/durduruluyor.
+    screen_busy: bool,
     watching: Option<String>,
     screen_tex: Option<(String, TextureHandle)>,
     speaking: HashSet<String>,
+    /// Son ölçülen ses seviyeleri (ayarlar penceresindeki gösterge için).
+    levels: Levels,
 
     modal: Option<Modal>,
     modal_focus: bool,
@@ -145,10 +151,12 @@ impl App {
             last_content_h: 0.0,
             composer: String::new(),
             my_voice: None,
-            voice_busy: false,
+            voice_joining: None,
+            screen_busy: false,
             watching: None,
             screen_tex: None,
             speaking: HashSet::new(),
+            levels: Levels::default(),
             modal: None,
             modal_focus: false,
             toast: None,
@@ -197,6 +205,10 @@ impl App {
                 });
             }
             "toast" => self.toast("Ses kanalına bağlanılıyor…", false),
+            "settings" => {
+                self.settings.input_auto = false;
+                self.modal = Some(Modal::Settings);
+            }
             _ => {}
         }
     }
@@ -220,14 +232,15 @@ impl App {
                 Event::Conn(c) => self.conn = c,
                 Event::Server(m) => self.handle_server(m),
                 Event::VoiceJoined { channel_id, session_id, tracks } => {
-                    self.voice_busy = false;
+                    self.voice_joining = None;
                     self.ws(json!({ "t": "voice_join", "channelId": channel_id, "sessionId": session_id,
                         "tracks": tracks, "muted": self.settings.muted, "deafened": self.settings.deafened }));
                     self.my_voice = Some(MyVoice { channel_id, session_id, tracks });
                 }
-                Event::VoiceJoinFailed => self.voice_busy = false,
+                Event::VoiceJoinFailed => self.voice_joining = None,
                 Event::VoiceLeft => {}
                 Event::Tracks(tracks) => {
+                    self.screen_busy = false;
                     if let Some(v) = &mut self.my_voice {
                         v.tracks = tracks.clone();
                         self.ws(json!({ "t": "voice_update", "tracks": tracks }));
@@ -270,11 +283,24 @@ impl App {
             }
         }
 
+        // Ses ayarlarını ses döngüsüne ilet (hassasiyet ve kişilere özel yükseklik).
+        *self.backend.shared.gate.lock() =
+            Gate { auto: self.settings.input_auto, threshold_db: self.settings.input_threshold_db };
+        {
+            let vols: HashMap<String, f32> = self
+                .voice
+                .iter()
+                .filter_map(|v| self.settings.user_volumes.get(&v.user_id.to_string()).map(|x| (v.session_id.clone(), *x)))
+                .collect();
+            *self.backend.shared.volumes.lock() = vols;
+        }
+
         // Konuşanlar
         let levels = self.backend.shared.levels.lock().clone();
+        self.levels = levels.clone();
         self.speaking.clear();
         if let Some(v) = &self.my_voice {
-            if !self.settings.muted && levels.me > SPEAK_LEVEL {
+            if levels.transmitting && levels.me > SPEAK_LEVEL {
                 self.speaking.insert(v.session_id.clone());
             }
             for (sid, l) in levels.peers {
@@ -416,14 +442,13 @@ impl App {
     }
 
     fn join_voice(&mut self, channel_id: i64) {
-        if self.voice_busy || self.my_voice.as_ref().is_some_and(|v| v.channel_id == channel_id) {
+        if self.voice_joining.is_some() || self.my_voice.as_ref().is_some_and(|v| v.channel_id == channel_id) {
             return;
         }
         if self.my_voice.is_some() {
             self.leave_voice();
         }
-        self.voice_busy = true;
-        self.toast("Ses kanalına bağlanılıyor…", false);
+        self.voice_joining = Some(channel_id);
         self.backend.voice(VoiceCmd::Join {
             channel_id,
             muted: self.settings.muted,
@@ -438,6 +463,7 @@ impl App {
         }
         self.watching = None;
         self.screen_tex = None;
+        self.screen_busy = false;
         if matches!(self.modal, Some(Modal::ScreenShare { .. })) {
             self.modal = None;
         }
@@ -508,7 +534,11 @@ impl App {
 
     fn toggle_screen_share(&mut self) {
         let Some(v) = &self.my_voice else { return };
+        if self.screen_busy {
+            return;
+        }
         if v.tracks.iter().any(|t| t == "screen") {
+            self.screen_busy = true;
             self.backend.voice(VoiceCmd::ScreenStop);
         } else {
             self.modal = Some(Modal::ScreenShare { sources: None, tab: SourceTab::Screens, selected: None });
@@ -626,12 +656,13 @@ impl App {
                         ui.label(RichText::new(&self.auth.error).color(RED).size(13.0));
                         ui.add_space(4.0);
                         let label = match (self.auth.busy, self.auth.registering) {
-                            (true, _) => "Bekleyin…",
+                            (true, true) => "Kayıt olunuyor…",
+                            (true, false) => "Giriş yapılıyor…",
                             (false, true) => "Kayıt ol",
                             (false, false) => "Giriş yap",
                         };
                         let w = ui.available_width();
-                        if widgets::accent_button(ui, label, w, !self.auth.busy).clicked() {
+                        if widgets::accent_button(ui, label, w, true, self.auth.busy).clicked() {
                             submit = true;
                         }
                         ui.add_space(8.0);
@@ -695,9 +726,13 @@ impl App {
             } else if self.channel_id.and_then(|id| self.channel(id)).is_some() {
                 self.chat(ui);
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new(if self.me.is_none() { "Bağlanıyor…" } else { "Bir kanal seç." }).color(MUTED));
-                });
+                if self.me.is_none() {
+                    widgets::loading_center(ui, "Sunucuya bağlanılıyor…");
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Bir kanal seç.").color(MUTED));
+                    });
+                }
             }
         });
     }
@@ -748,7 +783,7 @@ impl App {
         self.category(ui, "Metin kanalları", "text");
         for c in &texts {
             let active = self.channel_id == Some(c.id) && self.watching.is_none();
-            let (clicked, delete) = channel_row(ui, ph::HASH, &c.name, active);
+            let (clicked, delete) = channel_row(ui, ph::HASH, &c.name, active, false);
             if clicked {
                 self.select_channel(c.id);
             }
@@ -760,7 +795,8 @@ impl App {
         self.category(ui, "Ses kanalları", "voice");
         for c in &voices {
             let mine = self.my_voice.as_ref().is_some_and(|v| v.channel_id == c.id);
-            let (clicked, delete) = channel_row(ui, ph::SPEAKER_HIGH, &c.name, mine);
+            let joining = self.voice_joining == Some(c.id);
+            let (clicked, delete) = channel_row(ui, ph::SPEAKER_HIGH, &c.name, mine || joining, joining);
             if clicked {
                 self.join_voice(c.id);
             }
@@ -791,7 +827,39 @@ impl App {
     }
 
     fn voice_user_row(&mut self, ui: &mut Ui, u: &VoiceUser) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::hover());
+        let (rect, row) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), Sense::click());
+        let is_me = self.me.as_ref().is_some_and(|m| m.id == u.user_id);
+        if !is_me {
+            let key = u.user_id.to_string();
+            row.context_menu(|ui| {
+                ui.set_min_width(220.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new(&u.username).font(bold_font(13.5)).color(TEXT_STRONG));
+                ui.add_space(6.0);
+                widgets::section_label(ui, "Kullanıcı ses seviyesi");
+                let mut v = self.settings.user_volumes.get(&key).copied().unwrap_or(1.0) * 100.0;
+                let r = ui.add(egui::Slider::new(&mut v, 0.0..=200.0).step_by(1.0).suffix("%").trailing_fill(true));
+                if r.changed() {
+                    if (v - 100.0).abs() < 0.5 {
+                        self.settings.user_volumes.remove(&key);
+                    } else {
+                        self.settings.user_volumes.insert(key.clone(), v / 100.0);
+                    }
+                }
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    self.settings.save();
+                }
+                ui.add_space(4.0);
+                if ui.button("Varsayılana döndür (%100)").clicked() {
+                    self.settings.user_volumes.remove(&key);
+                    self.settings.save();
+                    ui.close();
+                }
+            });
+            if row.hovered() {
+                ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), CornerRadius::same(6), Color32::from_white_alpha(5));
+            }
+        }
         let mut x = rect.left() + 30.0;
         let av = egui::Rect::from_center_size(egui::pos2(x + 10.0, rect.center().y), Vec2::splat(20.0));
         widgets::paint_avatar(ui, av, &u.username, self.speaking.contains(&u.session_id));
@@ -840,6 +908,17 @@ impl App {
         };
         if let Some(icon) = flag {
             ui.painter().text(egui::pos2(right, rect.center().y), Align2::RIGHT_CENTER, icon, icon_font(14.0), RED);
+            right -= 20.0;
+        }
+        // Sesini kıstığımız/kapattığımız kişi
+        if let Some(v) = self.settings.user_volumes.get(&u.user_id.to_string()) {
+            if *v < 0.995 {
+                let icon = if *v <= 0.0 { ph::SPEAKER_SLASH } else { ph::SPEAKER_LOW };
+                let r = egui::Rect::from_center_size(egui::pos2(right - 7.0, rect.center().y), Vec2::splat(16.0));
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, icon, icon_font(14.0), MUTED);
+                ui.interact(r, ui.id().with(("vol", u.user_id)), Sense::hover())
+                    .on_hover_text(format!("Ses seviyesi %{:.0}", v * 100.0));
+            }
         }
     }
 
@@ -860,7 +939,9 @@ impl App {
                     self.leave_voice();
                 }
                 let tip = if sharing { "Paylaşımı durdur" } else { "Ekran paylaş" };
-                if widgets::icon_button(ui, ph::SCREENCAST, tip, if sharing { Tone::On } else { Tone::Normal }).clicked() {
+                if self.screen_busy {
+                    widgets::spinner_slot(ui, 32.0, if sharing { "Durduruluyor…" } else { "Paylaşım başlatılıyor…" });
+                } else if widgets::icon_button(ui, ph::SCREENCAST, tip, if sharing { Tone::On } else { Tone::Normal }).clicked() {
                     self.toggle_screen_share();
                 }
             });
@@ -877,8 +958,8 @@ impl App {
             ui.label(RichText::new(&name).font(bold_font(14.0)).color(TEXT_STRONG));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if widgets::icon_button(ui, ph::SIGN_OUT, "Çıkış yap", Tone::Normal).clicked() {
-                    self.logout();
+                if widgets::icon_button(ui, ph::GEAR_SIX, "Ayarlar", Tone::Normal).clicked() {
+                    self.modal = Some(Modal::Settings);
                 }
                 let d = self.settings.deafened;
                 let icon = if d { ph::EAR_SLASH } else { ph::HEADPHONES };
@@ -923,14 +1004,15 @@ impl App {
                     } else {
                         ui.add_space(12.0);
                     }
-                    let tip = if self.update_checking { "Denetleniyor…" } else { "Güncellemeleri denetle" };
-                    if widgets::icon_button(ui, ph::ARROWS_CLOCKWISE, tip, Tone::Normal).clicked() && !self.update_checking {
+                    if self.update_checking {
+                        widgets::spinner_slot(ui, 32.0, "Güncellemeler denetleniyor…");
+                    } else if widgets::icon_button(ui, ph::ARROWS_CLOCKWISE, "Güncellemeleri denetle", Tone::Normal).clicked() {
                         self.check_update(true);
                     }
                     if self.update_available {
                         let label = if self.update_busy { "İndiriliyor…" } else { "Güncelle" };
-                        let resp = widgets::pill_button(ui, label, !self.update_busy).on_hover_text("Yeni sürüm hazır");
-                        if resp.clicked() {
+                        let resp = widgets::pill_button(ui, label, self.update_busy).on_hover_text("Yeni sürüm hazır");
+                        if resp.clicked() && !self.update_busy {
                             self.update_busy = true;
                             self.backend.voice(VoiceCmd::ApplyUpdate);
                         }
@@ -942,6 +1024,7 @@ impl App {
                     };
                     if !text.is_empty() {
                         ui.label(RichText::new(text).size(12.0).color(if bad { RED } else { MUTED }));
+                        widgets::spinner(ui, 13.0, if bad { RED } else { MUTED });
                     }
                 });
             });
@@ -995,8 +1078,14 @@ impl App {
             .stick_to_bottom(true)
             .auto_shrink(false)
             .show(ui, |ui| {
+                if c.list.is_empty() && loading {
+                    widgets::loading_center(ui, "Mesajlar yükleniyor…");
+                    return;
+                }
                 ui.add_space(12.0);
-                if more && !c.list.is_empty() {
+                if loading {
+                    ui.vertical_centered(|ui| widgets::spinner(ui, 18.0, MUTED));
+                } else if more && !c.list.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("Yukarı kaydırarak eski mesajları yükle").size(12.0).color(MUTED));
                     });
@@ -1065,7 +1154,7 @@ impl App {
                 ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
             }
             None => {
-                ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Görüntü bekleniyor…", font(14.0), MUTED);
+                widgets::paint_loading(ui, rect, "Görüntü bekleniyor…");
             }
         }
         ui.allocate_rect(rect, Sense::hover());
@@ -1132,6 +1221,67 @@ impl App {
                             next = Some(Modal::DeleteChannel { id, name });
                         }
                     }
+                    Modal::Settings => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Ses ayarları").font(bold_font(18.0)).color(TEXT_STRONG));
+                        });
+                        ui.add_space(14.0);
+                        widgets::section_label(ui, "Giriş hassasiyeti");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Otomatik belirle").color(TEXT));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::toggle(ui, &mut self.settings.input_auto).changed() {
+                                    self.settings.save();
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        let in_voice = self.my_voice.is_some();
+                        let level = if in_voice { level_db(self.levels.me) } else { -100.0 };
+                        let auto = self.settings.input_auto;
+                        let mut th = if auto { self.levels.auto_threshold_db.min(-1.0) } else { self.settings.input_threshold_db };
+                        if auto && !in_voice {
+                            th = -45.0;
+                        }
+                        let r = widgets::sensitivity_bar(ui, &mut th, level, !auto);
+                        if !auto && r.changed() {
+                            self.settings.input_threshold_db = th;
+                        }
+                        if r.drag_stopped() {
+                            self.settings.save();
+                        }
+                        ui.add_space(6.0);
+                        let hint = if !in_voice {
+                            "Mikrofon seviyesini görmek için bir ses kanalına katıl.".to_string()
+                        } else if auto {
+                            "Arka plan gürültüsüne göre eşik kendiliğinden ayarlanıyor.".to_string()
+                        } else {
+                            format!("Eşik: {th:.0} dB. Çizginin sağına geçen sesler iletilir.")
+                        };
+                        ui.label(RichText::new(hint).size(12.5).color(MUTED));
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Kişilerin ses seviyesini değiştirmek için ses kanalında adlarına sağ tıkla.")
+                                .size(12.5)
+                                .color(MUTED),
+                        );
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if ui.link(RichText::new("Çıkış yap").color(RED).size(13.5)).clicked() {
+                                keep = false;
+                                self.logout();
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::accent_button(ui, "Tamam", 100.0, true, false).clicked() {
+                                    keep = false;
+                                }
+                            });
+                        });
+                        if keep {
+                            next = Some(Modal::Settings);
+                        }
+                    }
                     Modal::ScreenShare { sources, mut tab, mut selected } => {
                         ui.label(RichText::new("Ekran paylaş").font(bold_font(18.0)).color(TEXT_STRONG));
                         ui.add_space(10.0);
@@ -1155,13 +1305,12 @@ impl App {
                                         let active = tab == t;
                                         let bg = if active { ACTIVE } else if r.hovered() { HOVER } else { Color32::TRANSPARENT };
                                         ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
-                                        ui.painter().text(
-                                            rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            format!("{icon}  {label}"),
-                                            font(13.5),
-                                            if active { TEXT_STRONG } else { MUTED },
-                                        );
+                                        let fg = if active { TEXT_STRONG } else { MUTED };
+                                        let text = ui.painter().layout_no_wrap(label.to_string(), font(13.5), fg);
+                                        let total = 16.0 + 8.0 + text.size().x;
+                                        let x = rect.center().x - total / 2.0;
+                                        ui.painter().text(egui::pos2(x + 8.0, rect.center().y), Align2::CENTER_CENTER, icon, icon_font(16.0), fg);
+                                        ui.painter().galley(egui::pos2(x + 24.0, rect.center().y - text.size().y / 2.0), text, fg);
                                         if r.clicked() && !active {
                                             tab = t;
                                             let want = if t == SourceTab::Screens { "screen" } else { "window" };
@@ -1177,10 +1326,7 @@ impl App {
                         let mut share_now = false;
                         ScrollArea::vertical().max_height(300.0).min_scrolled_height(300.0).auto_shrink([false, false]).show(ui, |ui| {
                             match &sources {
-                                None => {
-                                    ui.add_space(20.0);
-                                    ui.vertical_centered(|ui| ui.label(RichText::new("Yükleniyor…").color(MUTED)));
-                                }
+                                None => widgets::loading_center(ui, "Ekranlar ve pencereler aranıyor…"),
                                 Some(list) => {
                                     let want = if tab == SourceTab::Screens { "screen" } else { "window" };
                                     let items: Vec<&SourceInfo> = list.iter().filter(|s| s.kind == want).collect();
@@ -1221,6 +1367,7 @@ impl App {
                                 .as_ref()
                                 .and_then(|l| l.iter().find(|s| Some(s.id.to_string()) == selected).cloned());
                             if let Some(s) = src {
+                                self.screen_busy = true;
                                 self.backend.voice(VoiceCmd::ScreenStart { id: s.id, kind: s.kind.clone() });
                             }
                             keep = false;
@@ -1295,7 +1442,7 @@ impl App {
 // ---------------------------------------------------------------- parçalar
 
 /// Kanal satırı. (tıklandı mı, sil düğmesine basıldı mı)
-fn channel_row(ui: &mut Ui, icon: &str, name: &str, active: bool) -> (bool, bool) {
+fn channel_row(ui: &mut Ui, icon: &str, name: &str, active: bool, loading: bool) -> (bool, bool) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     let hovered = resp.hovered() || ui.rect_contains_pointer(rect);
     let bg = if active { ACTIVE } else if hovered { HOVER } else { Color32::TRANSPARENT };
@@ -1304,7 +1451,10 @@ fn channel_row(ui: &mut Ui, icon: &str, name: &str, active: bool) -> (bool, bool
     ui.painter().text(egui::pos2(rect.left() + 18.0, rect.center().y), Align2::CENTER_CENTER, icon, icon_font(17.0), MUTED);
     ui.painter().text(egui::pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, truncate(name, 24), font(14.0), fg);
     let mut delete = false;
-    if hovered {
+    if loading {
+        let r = egui::Rect::from_center_size(egui::pos2(rect.right() - 16.0, rect.center().y), Vec2::splat(14.0));
+        widgets::spin(ui, r, MUTED);
+    } else if hovered {
         let del = egui::Rect::from_center_size(egui::pos2(rect.right() - 16.0, rect.center().y), Vec2::splat(22.0));
         let dr = ui.interact(del, ui.id().with(("del", name, rect.top() as i32)), Sense::click());
         let c = if dr.hovered() { TEXT_STRONG } else { MUTED };
@@ -1365,7 +1515,7 @@ fn modal_buttons(ui: &mut Ui, ok_text: &str, ok_enabled: bool) -> (bool, bool) {
     let mut ok = false;
     // Sabit yükseklikli satır: yoksa düzen tüm boş yüksekliği kaplar ve pencere uzar.
     ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 36.0), Layout::right_to_left(Align::Center), |ui| {
-        ok = widgets::accent_button(ui, ok_text, 100.0, ok_enabled).clicked();
+        ok = widgets::accent_button(ui, ok_text, 100.0, ok_enabled, false).clicked();
         cancel = widgets::secondary_button(ui, "Vazgeç", 90.0).clicked();
     });
     (cancel, ok)

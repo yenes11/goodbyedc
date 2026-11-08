@@ -55,13 +55,50 @@ pub struct ScreenFrame {
 #[derive(Default, Clone)]
 pub struct Levels {
     pub me: f32,
+    /// Mikrofon şu an ses gönderiyor mu (hassasiyet eşiğini geçti mi)?
+    pub transmitting: bool,
+    /// Otomatik modda o anki eşik (dB).
+    pub auto_threshold_db: f32,
     pub peers: HashMap<String, f32>,
 }
+
+/// Giriş hassasiyeti: mikrofon yalnızca ses bu eşiği geçince açılır.
+#[derive(Clone, Copy)]
+pub struct Gate {
+    /// Otomatik: arka plan gürültüsüne göre eşik kendiliğinden ayarlanır.
+    pub auto: bool,
+    /// Elle ayarlanan eşik (dB, -100..0).
+    pub threshold_db: f32,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self { auto: true, threshold_db: -45.0 }
+    }
+}
+
+/// 0..1 seviyeyi dB'ye çevirir (-100..0).
+pub fn level_db(level: f32) -> f32 {
+    if level <= 0.00001 {
+        -100.0
+    } else {
+        (20.0 * level.log10()).clamp(-100.0, 0.0)
+    }
+}
+
+/// Ses eşiği geçtikten sonra mikrofonun açık kalma süresi (kelime sonları kesilmesin).
+const GATE_HOLD: Duration = Duration::from_millis(400);
 
 /// Call ile paylaşılan, WebRTC callback'lerinden de erişilen durum.
 #[derive(Default)]
 pub struct Shared {
     pub deafened: AtomicBool,
+    pub muted: AtomicBool,
+    pub gate: Mutex<Gate>,
+    /// Oturum id'si -> çalma yüksekliği (0..2, 1 = normal).
+    pub volumes: Mutex<HashMap<String, f32>>,
+    /// mid -> uzak ses track'i (yüksekliği ayarlamak için)
+    pub audio_tracks: Mutex<HashMap<String, RtcAudioTrack>>,
     /// mid -> uzak oturum id'si (görüntünün kime ait olduğunu bilmek için)
     pub mid_owner: Mutex<HashMap<String, String>>,
     /// mid -> ekran izleme görevi
@@ -152,9 +189,11 @@ impl Call {
 
         let session_id = sfu.new_session().await?;
         let mic = factory.create_device_audio_track("mic");
-        mic.set_enabled(!muted);
+        shared.muted.store(muted, Ordering::Relaxed);
+        // Hassasiyet döngüsü eşik geçilince açar.
+        mic.set_enabled(false);
 
-        let stats_task = spawn(stats_loop(pc.clone(), shared.clone()));
+        let stats_task = spawn(stats_loop(pc.clone(), mic.clone(), shared.clone()));
         let call = Self {
             sfu,
             factory,
@@ -248,6 +287,7 @@ impl Call {
             h.abort();
         }
         self.shared.mid_owner.lock().remove(&mid);
+        self.shared.audio_tracks.lock().remove(&mid);
         let res = self
             .sfu
             .tracks_close(&self.session_id, json!({ "tracks": [{ "mid": mid }], "force": true }))
@@ -294,7 +334,11 @@ impl Call {
     }
 
     pub fn set_muted(&self, muted: bool) {
-        self.mic.set_enabled(!muted);
+        self.shared.muted.store(muted, Ordering::Relaxed);
+        if muted {
+            self.mic.set_enabled(false);
+        }
+        // Açılış, hassasiyet döngüsünde ses eşiği geçince olur.
     }
 
     pub fn set_deafened(&self, deafened: bool) {
@@ -365,6 +409,7 @@ impl Call {
             h.abort();
         }
         self.shared.mid_owner.lock().clear();
+        self.shared.audio_tracks.lock().clear();
         *self.shared.frame.lock() = None;
         *self.shared.levels.lock() = Levels::default();
         self.shared.request_repaint();
@@ -381,6 +426,8 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
             if shared.deafened.load(Ordering::Relaxed) {
                 t.set_enabled(false);
             }
+            // Yükseklik ayarı hassasiyet döngüsünde uygulanır (WebRTC iş parçacığını bekletmemek için).
+            shared.audio_tracks.lock().insert(mid, t);
         }
         MediaStreamTrack::Video(t) => {
             let owner = shared.mid_owner.lock().get(&mid).cloned().unwrap_or_default();
@@ -422,13 +469,23 @@ fn log_devices(factory: &PeerConnectionFactory) {
     );
 }
 
-/// Her 250 ms'de ses seviyelerini ölçüp arayüze gönderir ("kim konuşuyor").
+/// Her 50 ms'de ses seviyelerini ölçer:
+/// - "kim konuşuyor" bilgisini arayüze verir,
+/// - giriş hassasiyetine göre mikrofonu açıp kapatır,
+/// - kişilere özel ses yüksekliklerini uygular.
 /// Ayrıca birkaç saniyede bir gönderilen/alınan ses miktarını log'a yazar.
-async fn stats_loop(pc: PeerConnection, shared: Arc<Shared>) {
+async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>) {
     use libwebrtc::stats::RtcStats;
     let mut tick: u32 = 0;
+    let mut open_until: Option<Instant> = None;
+    let mut mic_on = false;
+    // Otomatik mod: arka plan gürültüsü tahmini (dB).
+    let mut noise_db: f32 = -60.0;
+    let mut applied: HashMap<String, f32> = HashMap::new();
+    let mut zero_ticks: u32 = 0;
+    let mut warned = false;
     loop {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         tick += 1;
         let Ok(stats) = pc.get_stats().await else { continue };
 
@@ -450,12 +507,64 @@ async fn stats_loop(pc: PeerConnection, shared: Arc<Shared>) {
                 _ => {}
             }
         }
-        if tick % 20 == 0 {
-            log::info!("ses: mikrofon seviyesi {me:.3}, gönderilen {sent} B, alınan {recv:?}, seviyeler {peers:?}");
+        if tick % 100 == 0 {
+            log::info!("ses: mikrofon seviyesi {me:.3}, açık {mic_on}, gönderilen {sent} B, alınan {recv:?}, seviyeler {peers:?}");
         }
+
+        // Giriş hassasiyeti
+        let db = level_db(me as f32);
+        let gate = *shared.gate.lock();
+        // Gürültü tabanı: aşağı hızlı, yukarı yavaş iner/çıkar (konuşma tabanı yükseltmesin).
+        noise_db = if db < noise_db { noise_db + (db - noise_db) * 0.3 } else { noise_db + (db - noise_db) * 0.01 };
+        let auto_threshold = (noise_db + 14.0).clamp(-60.0, -20.0);
+        let threshold = if gate.auto { auto_threshold } else { gate.threshold_db };
+        let now = Instant::now();
+        if db >= threshold {
+            open_until = Some(now + GATE_HOLD);
+        }
+        // Güvenlik: kapalıyken seviye hiç ölçülmüyorsa (tam 0), eşik sonsuza dek kapalı
+        // kalmasın diye arada kısa süre açıp ölçüm al.
+        if me == 0.0 && !mic_on {
+            zero_ticks += 1;
+            if zero_ticks >= 40 {
+                if !warned {
+                    log::warn!("mikrofon kapalıyken seviye ölçülemiyor; hassasiyet aralıklı ölçümle çalışacak");
+                    warned = true;
+                }
+                open_until = Some(now + Duration::from_millis(300));
+                zero_ticks = 0;
+            }
+        } else {
+            zero_ticks = 0;
+        }
+        let open = open_until.is_some_and(|t| now < t);
+        let want = open && !shared.muted.load(Ordering::Relaxed);
+        if want != mic_on {
+            mic.set_enabled(want);
+            mic_on = want;
+        }
+
+        // Kişilere özel ses yüksekliği
+        {
+            let volumes = shared.volumes.lock().clone();
+            let tracks: Vec<(String, RtcAudioTrack)> =
+                shared.audio_tracks.lock().iter().map(|(m, t)| (m.clone(), t.clone())).collect();
+            applied.retain(|mid, _| tracks.iter().any(|(m, _)| m == mid));
+            for (mid, track) in tracks {
+                let Some(owner) = owners.get(&mid) else { continue };
+                let v = volumes.get(owner).copied().unwrap_or(1.0);
+                if applied.get(&mid) != Some(&v) {
+                    track.set_volume(v as f64);
+                    applied.insert(mid, v);
+                }
+            }
+        }
+
         {
             let mut lv = shared.levels.lock();
             lv.me = me as f32;
+            lv.transmitting = mic_on;
+            lv.auto_threshold_db = auto_threshold;
             lv.peers = peers.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect();
         }
         shared.request_repaint();

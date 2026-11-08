@@ -312,7 +312,10 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
                 let Some(c) = call.as_mut() else { continue };
                 match c.start_screen(id, kind).await {
                     Ok(()) => sink.send(Event::Tracks(c.tracks().into_iter().map(String::from).collect())),
-                    Err(e) => sink.toast(format!("Ekran paylaşılamadı: {e:#}"), true),
+                    Err(e) => {
+                        sink.toast(format!("Ekran paylaşılamadı: {e:#}"), true);
+                        sink.send(Event::Tracks(c.tracks().into_iter().map(String::from).collect()));
+                    }
                 }
             }
             VoiceCmd::ScreenStop => {

@@ -34,3 +34,8 @@ winresource = "0.1"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# Kişiye özel ses yüksekliği için küçük bir ekleme (AudioTrack::set_volume) yapılmış kopyalar.
+[patch.crates-io]
+libwebrtc = { path = "vendor/libwebrtc" }
+webrtc-sys = { path = "vendor/webrtc-sys" }
