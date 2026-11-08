@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod backend;
 mod config;
+mod ducking;
 mod meter;
 mod screen;
 mod sfu;

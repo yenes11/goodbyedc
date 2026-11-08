@@ -1876,6 +1876,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite",
+ "windows 0.54.0",
  "winresource",
 ]
 

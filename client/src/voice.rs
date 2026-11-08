@@ -195,12 +195,16 @@ impl Call {
             pc.on_track(Some(Box::new(move |ev: TrackEvent| on_track(&shared, ev))));
         }
 
+        // Windows diğer uygulamaların sesini kısmasın (aygıt açılmadan önce ve sonra).
+        let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
+
         // Gerçek mikrofon/hoparlör (platform ADM, yankı engelleme dahil).
         if !factory.acquire_platform_adm() {
             return Err(anyhow!("Ses aygıtı başlatılamadı"));
         }
         factory.set_adm_recording_enabled(true);
         factory.set_adm_playout_enabled(true);
+        let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
         log_devices(&factory);
 
         let session_id = sfu.new_session().await?;
