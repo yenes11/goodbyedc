@@ -17,7 +17,8 @@ mod macos;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("goodbyedc=info")).init();
+    init_logging();
+    log::info!("goodbyedc {} başladı ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
     update::startup();
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio başlatılamadı");
@@ -52,4 +53,39 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, backend)))),
     )
+}
+
+/// Logları hem konsola hem de ayar klasöründeki `goodbyedc.log` dosyasına yazar
+/// (Windows'ta konsol olmadığı için sorunları dosyadan okuyabilmek için).
+/// Bir önceki çalıştırmanın logu `goodbyedc.old.log` olarak saklanır.
+fn init_logging() {
+    use std::io::Write;
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("goodbyedc=info"));
+    builder.format(|buf, rec| {
+        writeln!(buf, "{} {:5} {}", chrono::Local::now().format("%H:%M:%S%.3f"), rec.level(), rec.args())
+    });
+    let file = config::dir().and_then(|d| {
+        std::fs::create_dir_all(&d).ok()?;
+        let path = d.join("goodbyedc.log");
+        let _ = std::fs::rename(&path, d.join("goodbyedc.old.log"));
+        std::fs::File::create(path).ok()
+    });
+    if let Some(file) = file {
+        builder.target(env_logger::Target::Pipe(Box::new(Tee(file))));
+    }
+    builder.init();
+}
+
+/// Hem dosyaya hem standart hataya yazar.
+struct Tee(std::fs::File);
+
+impl std::io::Write for Tee {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(b);
+        self.0.write_all(b)?;
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }

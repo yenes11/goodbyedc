@@ -267,8 +267,47 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
     let factory = PeerConnectionFactory::default();
     let shared = sink.shared.clone();
     let mut call: Option<Call> = None;
+    // Bağlantı koparsa aynı kanala yeniden katılmak için.
+    let mut current: Option<(i64, String)> = None;
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    while let Some((token, cmd)) = rx.recv().await {
+    loop {
+        let (token, cmd) = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(m) => m,
+                None => break,
+            },
+            _ = tick.tick() => {
+                let broken = call.as_ref().is_some_and(|c| c.is_broken());
+                if broken {
+                    if let (Some(old), Some((channel_id, token))) = (call.take(), current.clone()) {
+                        log::warn!("ses bağlantısı koptu, yeniden katılınıyor");
+                        old.leave();
+                        let muted = shared.muted.load(std::sync::atomic::Ordering::Relaxed);
+                        let deafened = shared.deafened.load(std::sync::atomic::Ordering::Relaxed);
+                        match Call::join(factory.clone(), Sfu::new(&base, &token), shared.clone(), muted).await {
+                            Ok(c) => {
+                                c.set_deafened(deafened);
+                                let tracks = c.tracks().into_iter().map(String::from).collect();
+                                sink.send(Event::VoiceJoined { channel_id, session_id: c.session_id.clone(), tracks });
+                                sink.toast("Ses bağlantısı koptu, yeniden bağlanıldı", false);
+                                call = Some(c);
+                            }
+                            Err(e) => {
+                                log::warn!("yeniden katılınamadı: {e:#}");
+                                current = None;
+                                sink.toast("Ses bağlantısı koptu, yeniden bağlanılamadı", true);
+                                sink.send(Event::VoiceLeft);
+                            }
+                        }
+                    }
+                } else if let Some(c) = call.as_mut() {
+                    c.heal().await;
+                }
+                continue;
+            }
+        };
         match cmd {
             VoiceCmd::Join { channel_id, muted, deafened } => {
                 if let Some(old) = call.take() {
@@ -280,14 +319,17 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
                         let tracks = c.tracks().into_iter().map(String::from).collect();
                         sink.send(Event::VoiceJoined { channel_id, session_id: c.session_id.clone(), tracks });
                         call = Some(c);
+                        current = Some((channel_id, token));
                     }
                     Err(e) => {
+                        current = None;
                         sink.toast(format!("Ses kanalına bağlanılamadı: {e:#}"), true);
                         sink.send(Event::VoiceJoinFailed);
                     }
                 }
             }
             VoiceCmd::Leave => {
+                current = None;
                 if let Some(c) = call.take() {
                     c.leave();
                     sink.send(Event::VoiceLeft);

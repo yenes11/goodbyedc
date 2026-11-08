@@ -62,11 +62,16 @@ fn default_threshold() -> f32 {
     -45.0
 }
 
-fn path() -> Option<PathBuf> {
+/// Ayarların ve log dosyasının bulunduğu klasör.
+pub fn dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("GOODBYEDC_CONFIG_DIR") {
-        return Some(PathBuf::from(dir).join("settings.json"));
+        return Some(PathBuf::from(dir));
     }
-    Some(dirs::config_dir()?.join("goodbyedc").join("settings.json"))
+    Some(dirs::config_dir()?.join("goodbyedc"))
+}
+
+fn path() -> Option<PathBuf> {
+    Some(dir()?.join("settings.json"))
 }
 
 impl Settings {

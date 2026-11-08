@@ -238,7 +238,15 @@ impl App {
                     self.my_voice = Some(MyVoice { channel_id, session_id, tracks });
                 }
                 Event::VoiceJoinFailed => self.voice_joining = None,
-                Event::VoiceLeft => {}
+                Event::VoiceLeft => {
+                    // Arka plan bağlantıyı kendisi bıraktıysa (yeniden bağlanılamadı) arayüzü de güncelle.
+                    if self.my_voice.take().is_some() {
+                        self.ws(json!({ "t": "voice_leave" }));
+                        self.watching = None;
+                        self.screen_tex = None;
+                        self.screen_busy = false;
+                    }
+                }
                 Event::Tracks(tracks) => {
                     self.screen_busy = false;
                     if let Some(v) = &mut self.my_voice {

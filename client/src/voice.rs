@@ -99,6 +99,10 @@ pub struct Shared {
     pub volumes: Mutex<HashMap<String, f32>>,
     /// mid -> uzak ses track'i (yüksekliği ayarlamak için)
     pub audio_tracks: Mutex<HashMap<String, RtcAudioTrack>>,
+    /// Bir süredir hiç veri gelmeyen (takılmış) ses track'lerinin mid'leri.
+    pub stalled: Mutex<HashSet<String>>,
+    /// WebRTC bağlantısının durumu ve bu duruma geçiş anı.
+    pub pc_state: Mutex<Option<(PeerConnectionState, Instant)>>,
     /// mid -> uzak oturum id'si (görüntünün kime ait olduğunu bilmek için)
     pub mid_owner: Mutex<HashMap<String, String>>,
     /// mid -> ekran izleme görevi
@@ -119,7 +123,7 @@ impl Shared {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Participant {
     pub session_id: String,
@@ -141,6 +145,10 @@ pub struct Call {
     screen: Option<LocalScreen>,
     /// "oturumId/trackAdı" -> mid
     pulled: HashMap<String, String>,
+    /// Son bilinen katılımcılar ve izlenen ekran (başarısız çekmeleri yeniden denemek için).
+    last_sync: (Vec<Participant>, Option<String>),
+    /// Takıldığı için yeniden çekilen track'lerin son deneme anı.
+    repulled: HashMap<String, Instant>,
     shared: Arc<Shared>,
     stats_task: JoinHandle<()>,
 }
@@ -173,7 +181,15 @@ impl Call {
         });
         let pc = factory.create_peer_connection(config).map_err(|e| anyhow!("{e}"))?;
 
-        pc.on_connection_state_change(Some(Box::new(|s| log::info!("bağlantı durumu: {s:?}"))));
+        *shared.pc_state.lock() = None;
+        shared.stalled.lock().clear();
+        {
+            let shared = shared.clone();
+            pc.on_connection_state_change(Some(Box::new(move |s| {
+                log::info!("bağlantı durumu: {s:?}");
+                *shared.pc_state.lock() = Some((s, Instant::now()));
+            })));
+        }
         {
             let shared = shared.clone();
             pc.on_track(Some(Box::new(move |ev: TrackEvent| on_track(&shared, ev))));
@@ -202,6 +218,8 @@ impl Call {
             mic: mic.clone(),
             screen: None,
             pulled: HashMap::new(),
+            last_sync: (Vec::new(), None),
+            repulled: HashMap::new(),
             shared,
             stats_task,
         };
@@ -303,6 +321,7 @@ impl Call {
     /// Ses kanalındaki katılımcılara göre çekilen track'leri günceller.
     /// `watch`: ekranını izlediğimiz kişinin oturum id'si.
     pub async fn sync(&mut self, participants: &[Participant], watch: Option<&str>) {
+        self.last_sync = (participants.to_vec(), watch.map(String::from));
         let mut desired: HashSet<(String, String)> = HashSet::new();
         for p in participants {
             if p.session_id == self.session_id {
@@ -331,6 +350,35 @@ impl Call {
                 log::warn!("track çekilemedi {sid}/{track}: {e:#}");
             }
         }
+    }
+
+    /// Bağlantı koptu mu (yeniden katılmak gerekir mi)?
+    pub fn is_broken(&self) -> bool {
+        match *self.shared.pc_state.lock() {
+            Some((PeerConnectionState::Failed, _)) => true,
+            Some((PeerConnectionState::Disconnected, t)) => t.elapsed() > Duration::from_secs(8),
+            _ => false,
+        }
+    }
+
+    /// Düzenli bakım: takılmış ses track'lerini kapatıp yeniden çeker ve
+    /// daha önce çekilemeyen track'leri yeniden dener.
+    pub async fn heal(&mut self) {
+        let stalled: Vec<String> = self.shared.stalled.lock().drain().collect();
+        for mid in stalled {
+            let Some(key) = self.pulled.iter().find(|(_, m)| **m == mid).map(|(k, _)| k.clone()) else { continue };
+            if self.repulled.get(&key).is_some_and(|t| t.elapsed() < Duration::from_secs(15)) {
+                continue;
+            }
+            log::warn!("{key} sesinden bir süredir veri gelmiyor, yeniden çekiliyor");
+            self.repulled.insert(key.clone(), Instant::now());
+            if let Err(e) = self.unpull(&key).await {
+                log::warn!("takılan track kapatılamadı {key}: {e:#}");
+                self.pulled.remove(&key);
+            }
+        }
+        let (participants, watch) = self.last_sync.clone();
+        self.sync(&participants, watch.as_deref()).await;
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -483,6 +531,8 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
     let mut noise_db: f32 = -60.0;
     let mut applied: HashMap<String, f32> = HashMap::new();
     let mut zero_ticks: u32 = 0;
+    // mid -> (alınan bayt, son değişim anı)
+    let mut inbound: HashMap<String, (u64, Instant)> = HashMap::new();
     let mut warned = false;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -494,17 +544,35 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
         let mut peers = serde_json::Map::new();
         let mut recv = serde_json::Map::new();
         let owners = shared.mid_owner.lock().clone();
+        // Çekilen her ses track'i için alınan bayt (hiç istatistiği yoksa 0).
+        let mut bytes_now: HashMap<String, u64> =
+            shared.audio_tracks.lock().keys().map(|m| (m.clone(), 0)).collect();
         for st in &stats {
             match st {
                 RtcStats::MediaSource(m) if m.source.kind == "audio" => me = me.max(m.audio.audio_level),
                 RtcStats::OutboundRtp(o) if o.stream.kind == "audio" => sent += o.sent.bytes_sent,
                 RtcStats::InboundRtp(i) if i.stream.kind == "audio" => {
+                    bytes_now.insert(i.inbound.mid.clone(), i.inbound.bytes_received);
                     if let Some(owner) = owners.get(&i.inbound.mid) {
                         peers.insert(owner.clone(), json!(i.inbound.audio_level));
                         recv.insert(owner.clone(), json!(i.inbound.bytes_received));
                     }
                 }
                 _ => {}
+            }
+        }
+        // Takılan ses: 6 saniyedir hiç yeni veri gelmiyorsa yeniden çekilsin.
+        {
+            let now = Instant::now();
+            inbound.retain(|mid, _| bytes_now.contains_key(mid));
+            for (mid, bytes) in &bytes_now {
+                let e = inbound.entry(mid.clone()).or_insert((*bytes, now));
+                if e.0 != *bytes {
+                    *e = (*bytes, now);
+                } else if now.duration_since(e.1) > Duration::from_secs(6) && owners.contains_key(mid) {
+                    shared.stalled.lock().insert(mid.clone());
+                    e.1 = now;
+                }
             }
         }
         if tick % 100 == 0 {
