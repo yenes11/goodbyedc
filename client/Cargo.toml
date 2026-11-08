@@ -21,6 +21,7 @@ libwebrtc = "0.4"
 sha2 = "0.10"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cpal = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = "0.3"

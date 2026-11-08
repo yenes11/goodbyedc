@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod backend;
 mod config;
+mod meter;
 mod screen;
 mod sfu;
 mod theme;
@@ -20,6 +21,16 @@ fn main() -> eframe::Result {
     init_logging();
     log::info!("goodbyedc {} başladı ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
     update::startup();
+    #[cfg(debug_assertions)]
+    if std::env::var("GOODBYEDC_METER_TEST").is_ok() {
+        let m = meter::Meter::start().expect("ölçer açılamadı");
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let l = m.take_level();
+            println!("seviye {l:.4} ({:.0} dB)", voice::level_db(l));
+        }
+        return Ok(());
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio başlatılamadı");
     let backend = backend::Backend::start(&rt, config::server_url());

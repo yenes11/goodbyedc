@@ -209,7 +209,12 @@ impl Call {
         // Hassasiyet döngüsü eşik geçilince açar.
         mic.set_enabled(false);
 
-        let stats_task = spawn(stats_loop(pc.clone(), mic.clone(), shared.clone()));
+        // Mikrofon seviyesini ayrıca ölç (WebRTC, track kapalıyken ölçmüyor).
+        let meter = tokio::task::spawn_blocking(crate::meter::Meter::start).await.ok().flatten();
+        if meter.is_none() {
+            log::warn!("mikrofon ölçer yok: giriş hassasiyeti devre dışı, mikrofon hep açık");
+        }
+        let stats_task = spawn(stats_loop(pc.clone(), mic.clone(), meter, shared.clone()));
         let call = Self {
             sfu,
             factory,
@@ -522,7 +527,7 @@ fn log_devices(factory: &PeerConnectionFactory) {
 /// - giriş hassasiyetine göre mikrofonu açıp kapatır,
 /// - kişilere özel ses yüksekliklerini uygular.
 /// Ayrıca birkaç saniyede bir gönderilen/alınan ses miktarını log'a yazar.
-async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>) {
+async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate::meter::Meter>, shared: Arc<Shared>) {
     use libwebrtc::stats::RtcStats;
     let mut tick: u32 = 0;
     let mut open_until: Option<Instant> = None;
@@ -530,10 +535,8 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
     // Otomatik mod: arka plan gürültüsü tahmini (dB).
     let mut noise_db: f32 = -60.0;
     let mut applied: HashMap<String, f32> = HashMap::new();
-    let mut zero_ticks: u32 = 0;
     // mid -> (alınan bayt, son değişim anı)
     let mut inbound: HashMap<String, (u64, Instant)> = HashMap::new();
-    let mut warned = false;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         tick += 1;
@@ -580,7 +583,12 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
         }
 
         // Giriş hassasiyeti
-        let db = level_db(me as f32);
+        // Seviye ayrı ölçerden gelir; WebRTC'nin değeri track kapalıyken 0 olur.
+        let level = meter.as_ref().map(|m| m.take_level()).unwrap_or(me as f32);
+        let db = level_db(level);
+        if tick % 100 == 0 {
+            log::info!("ses: ölçer seviyesi {level:.3} ({db:.0} dB)");
+        }
         let gate = *shared.gate.lock();
         // Gürültü tabanı: aşağı hızlı, yukarı yavaş iner/çıkar (konuşma tabanı yükseltmesin).
         // Gürültü tabanı: aşağı hızlı iner; yukarı yalnızca konuşulmuyorken (eşik kapalıyken)
@@ -602,22 +610,8 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
         if db >= threshold {
             open_until = Some(now + GATE_HOLD);
         }
-        // Güvenlik: kapalıyken seviye hiç ölçülmüyorsa (tam 0), eşik sonsuza dek kapalı
-        // kalmasın diye arada kısa süre açıp ölçüm al.
-        if me == 0.0 && !mic_on {
-            zero_ticks += 1;
-            if zero_ticks >= 40 {
-                if !warned {
-                    log::warn!("mikrofon kapalıyken seviye ölçülemiyor; hassasiyet aralıklı ölçümle çalışacak");
-                    warned = true;
-                }
-                open_until = Some(now + Duration::from_millis(300));
-                zero_ticks = 0;
-            }
-        } else {
-            zero_ticks = 0;
-        }
-        let open = open_until.is_some_and(|t| now < t);
+        // Ölçer yoksa eşik uygulanmaz: mikrofon hep açık.
+        let open = meter.is_none() || open_until.is_some_and(|t| now < t);
         let want = open && !shared.muted.load(Ordering::Relaxed);
         if want != mic_on {
             mic.set_enabled(want);
@@ -642,7 +636,7 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
 
         {
             let mut lv = shared.levels.lock();
-            lv.me = me as f32;
+            lv.me = level;
             lv.transmitting = mic_on;
             lv.auto_threshold_db = auto_threshold;
             lv.peers = peers.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect();
