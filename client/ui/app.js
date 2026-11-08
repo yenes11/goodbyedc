@@ -84,7 +84,7 @@ function esc(s) {
 function colorFor(name) {
   let h = 0;
   for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
-  const colors = ["#5865f2", "#3ba55c", "#faa61a", "#ed4245", "#eb459e", "#9b59b6", "#1abc9c", "#e67e22"];
+  const colors = ["#d97757", "#6a9bcc", "#7fae6a", "#c9a227", "#b86fa8", "#4fa79c", "#c4825a", "#8a7fd1"];
   return colors[h % colors.length];
 }
 

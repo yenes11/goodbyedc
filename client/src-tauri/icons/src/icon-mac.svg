@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B88FA"/>
+      <stop offset="1" stop-color="#1A5AD0"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B76F2"/>
+      <stop offset="1" stop-color="#1A5AD0"/>
+    </linearGradient>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="150%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="18.0"/>
+      <feOffset dy="14.0"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <g filter="url(#sh)">
+    <path fill="#F7F9FC" d="
+      M 322.0 286.0
+      h 380.0
+      a 104.0 104.0 0 0 1 104.0 104.0
+      v 204.0
+      a 104.0 104.0 0 0 1 -104.0 104.0
+      h -238.0
+      l -118.0 96.0
+      v -98.0
+      a 104.0 104.0 0 0 1 -128.0 -102.0
+      v -204.0
+      a 104.0 104.0 0 0 1 104.0 -104.0
+      z"/>
+  </g>
+  <rect x="333.0" y="444.0" width="46.0" height="96.0" rx="23.0" fill="url(#bar)"/><rect x="411.0" y="404.0" width="46.0" height="176.0" rx="23.0" fill="url(#bar)"/><rect x="489.0" y="367.0" width="46.0" height="250.0" rx="23.0" fill="url(#bar)"/><rect x="567.0" y="404.0" width="46.0" height="176.0" rx="23.0" fill="url(#bar)"/><rect x="645.0" y="444.0" width="46.0" height="96.0" rx="23.0" fill="url(#bar)"/>
+</svg>
