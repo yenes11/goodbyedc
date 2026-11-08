@@ -24,6 +24,9 @@ const ICONS = {
   hash: '<path d="M4 9h16"/><path d="M4 15h16"/><path d="M10 3 8 21"/><path d="M16 3l-2 18"/>',
   x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
   plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  winMin: '<path d="M5 12h14"/>',
+  winMax: '<rect width="14" height="14" x="5" y="5" rx="1"/>',
+  winRestore: '<rect width="11" height="11" x="5" y="8" rx="1"/><path d="M9 8V6a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-2"/>',
   refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
 };
 
@@ -32,6 +35,27 @@ function icon(name, size = 20) {
 }
 
 document.querySelectorAll("[data-icon]").forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
+
+// ------------------------------------------------------------- pencere
+// macOS: sistem düğmeleri (kırmızı/sarı/yeşil) kenar çubuğunun sol üstüne yerleşir.
+// Windows/Linux: pencere çerçevesiz açılır, düğmeleri biz çizeriz.
+// Tarayıcıda (geliştirme) ikisi de yok.
+const isMac = /Mac/i.test(navigator.platform || navigator.userAgent);
+document.documentElement.dataset.os = !tauri ? "browser" : isMac ? "mac" : "other";
+
+if (tauri && !isMac) {
+  const win = tauri.window.getCurrentWindow();
+  $("win-min").onclick = () => win.minimize();
+  $("win-max").onclick = () => win.toggleMaximize();
+  $("win-close").onclick = () => win.close();
+  const syncMax = async () => {
+    const max = await win.isMaximized();
+    $("win-max").innerHTML = icon(max ? "winRestore" : "winMax");
+    $("win-max").title = max ? "Önceki boyut" : "Büyüt";
+  };
+  win.onResized(syncMax);
+  syncMax();
+}
 
 const state = {
   base: BASE,
@@ -390,8 +414,6 @@ function renderChannels() {
   $("btn-deafen").classList.toggle("off", state.deafened);
   $("btn-mute").innerHTML = icon(state.muted ? "micOff" : "mic");
   $("btn-deafen").innerHTML = icon(state.deafened ? "headphonesOff" : "headphones");
-  const srv = state.servers.find((s) => s.id === state.serverId);
-  $("server-name").textContent = srv ? srv.name : "";
 }
 
 function renderMain() {
@@ -722,7 +744,7 @@ async function checkUpdate(manual = false) {
   btn.classList.add("spin");
   try {
     const r = await invoke("update_check");
-    $("update-bar").classList.toggle("hidden", !r.available);
+    $("btn-update").classList.toggle("hidden", !r.available);
     if (manual) {
       if (!r.supported) toast("Bu sürüm elle derlendiği için otomatik güncellenmiyor");
       else if (!r.available) toast("Uygulama güncel");

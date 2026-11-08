@@ -7,8 +7,16 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- Pencere düğmeleri (Windows/Linux). macOS'ta sistemin kendi düğmeleri kullanılır. -->
+  <div class="win-controls">
+    <button id="win-min" class="win-btn" title="Küçült" data-icon="winMin"></button>
+    <button id="win-max" class="win-btn" title="Büyüt" data-icon="winMax"></button>
+    <button id="win-close" class="win-btn close" title="Kapat" data-icon="x"></button>
+  </div>
+
   <!-- Giriş ekranı -->
   <div id="auth" class="auth hidden">
+    <div class="auth-drag" data-tauri-drag-region></div>
     <form id="auth-form" class="auth-card">
       <h1>goodbyedc</h1>
       <p class="muted" id="auth-sub">Tekrar hoş geldin!</p>
@@ -33,15 +41,9 @@
   <!-- Ana uygulama -->
   <div id="app" class="app hidden">
     <aside class="sidebar">
-      <header class="server-header">
-        <span id="server-name"></span>
+      <header class="server-header" data-tauri-drag-region>
       </header>
       <div id="channels" class="channels"></div>
-
-      <div id="update-bar" class="update-bar hidden">
-        <span>Yeni sürüm hazır</span>
-        <button id="btn-update">Güncelle</button>
-      </div>
 
       <div id="usage" class="usage"></div>
 
@@ -61,15 +63,18 @@
         <div class="me-name" id="me-name"></div>
         <button id="btn-mute" class="icon-btn" title="Sustur" data-icon="mic"></button>
         <button id="btn-deafen" class="icon-btn" title="Sağırlaştır" data-icon="headphones"></button>
-        <button id="btn-check-update" class="icon-btn" title="Güncellemeleri denetle" data-icon="refresh"></button>
         <button id="btn-logout" class="icon-btn" title="Çıkış yap" data-icon="logOut"></button>
       </footer>
     </aside>
 
     <main class="main">
-      <header class="channel-header">
-        <span id="channel-title"></span>
-        <span id="conn-status" class="conn-status"></span>
+      <header class="channel-header" data-tauri-drag-region>
+        <span id="channel-title" data-tauri-drag-region></span>
+        <div class="toolbar" data-tauri-drag-region>
+          <span id="conn-status" class="conn-status"></span>
+          <button id="btn-update" class="update-pill hidden" title="Yeni sürüm hazır">Güncelle</button>
+          <button id="btn-check-update" class="icon-btn" title="Güncellemeleri denetle" data-icon="refresh"></button>
+        </div>
       </header>
 
       <section id="chat" class="chat">

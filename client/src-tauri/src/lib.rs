@@ -154,6 +154,18 @@ pub fn run() {
             call: Mutex::new(None),
             shared: Arc::new(Shared::default()),
         })
+        .setup(|_app| {
+            // macOS'ta sistem düğmeleri kenar çubuğunun üstüne yerleşir (titleBarStyle: Overlay).
+            // Windows/Linux'ta sistem çerçevesi kaldırılır, düğmeleri arayüz çizer.
+            #[cfg(not(target_os = "macos"))]
+            {
+                use tauri::Manager;
+                if let Some(w) = _app.get_webview_window("main") {
+                    let _ = w.set_decorations(false);
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             voice_join,
             voice_leave,

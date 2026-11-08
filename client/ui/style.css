@@ -78,6 +78,31 @@ a { color: #00a8fc; text-decoration: none; }
 .icon-btn.danger { color: var(--text); }
 .icon-btn.danger:hover { background: var(--red); color: white; }
 
+/* ---------- Pencere ---------- */
+/* Üst kısımlar pencere çubuğu görevi görür (sürüklenebilir, 48px). */
+.win-controls { position: fixed; top: 0; right: 0; height: 48px; display: flex; z-index: 30; }
+.win-btn {
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border-radius: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--muted);
+}
+.win-btn .ic { width: 16px; height: 16px; }
+.win-btn:hover { background: var(--bg-active); color: var(--text); }
+.win-btn.close:hover { background: #e81123; color: white; }
+:root:not([data-os="other"]) .win-controls { display: none; }
+/* Windows: araç çubuğu pencere düğmelerinin altına girmesin. */
+[data-os="other"] .channel-header { padding-right: 150px; }
+/* macOS: sistem düğmelerine yer aç. */
+[data-os="mac"] .server-header { padding-left: 84px; }
+
+.auth { position: relative; }
+.auth-drag { position: absolute; top: 0; left: 0; right: 0; height: 48px; }
+
 /* ---------- Giriş ---------- */
 .auth {
   height: 100%;
@@ -173,23 +198,6 @@ a { color: #00a8fc; text-decoration: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .icon-btn.spin .ic { animation: spin .8s linear infinite; }
 
-.update-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin: 0 8px 6px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: rgba(35, 165, 90, .15);
-  color: var(--text-strong);
-  font-size: 13px;
-  font-weight: 600;
-}
-.update-bar button { padding: 5px 10px; font-size: 13px; background: var(--green); }
-.update-bar button:hover { background: #1a8a4a; }
-.update-bar button:disabled { opacity: .7; cursor: default; }
-
 .usage { padding: 4px 10px; font-size: 11px; color: var(--muted); }
 .usage.warn { color: #fa777c; }
 
@@ -238,6 +246,10 @@ a { color: #00a8fc; text-decoration: none; }
 }
 #channel-title { display: flex; align-items: center; gap: 6px; }
 #channel-title .ic { color: var(--muted); }
+.toolbar { display: flex; align-items: center; gap: 6px; height: 100%; }
+.update-pill { padding: 4px 12px; font-size: 13px; font-weight: 600; border-radius: 999px; background: var(--green); }
+.update-pill:hover { background: #1a8a4a; }
+.update-pill:disabled { opacity: .7; cursor: default; }
 .conn-status { font-size: 12px; font-weight: 400; color: var(--muted); }
 .conn-status.bad { color: #fa777c; }
 
