@@ -1,0 +1,63 @@
+# İstemci kodunda değişiklik push'lanınca Windows exe'sini derler ve
+# en son sürüm (latest release) olarak yayınlar. Uygulamalardaki
+# "Güncellemeleri denetle" düğmesi bu sürümü indirir.
+name: Windows sürümü
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "client/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: client/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Derle
+        shell: bash
+        run: npx --yes @tauri-apps/cli@2 build --no-bundle
+
+      - name: Dosyaları hazırla
+        shell: bash
+        run: |
+          mkdir -p ../../dist
+          cp target/release/goodbyedc.exe ../../dist/goodbyedc-windows-x86_64.exe
+          cd ../../dist
+          sha256sum goodbyedc-windows-x86_64.exe | cut -d' ' -f1 > goodbyedc-windows-x86_64.exe.sha256
+          cat goodbyedc-windows-x86_64.exe.sha256
+          ls -la
+
+      - name: Yayınla
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Sürüm ${{ github.run_number }}
+          body: ${{ github.event.head_commit.message }}
+          make_latest: true
+          files: |
+            dist/goodbyedc-windows-x86_64.exe
+            dist/goodbyedc-windows-x86_64.exe.sha256

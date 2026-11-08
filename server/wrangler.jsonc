@@ -9,9 +9,11 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
   "vars": {
     // Cloudflare Dashboard > Realtime > SFU uygulamasının App ID'si
-    "REALTIME_APP_ID": "",
+    "REALTIME_APP_ID": "c880ee896eb22a5797e9003eedadf2d6",
     // Cloudflare Dashboard > Realtime > TURN anahtarının Key ID'si (boş bırakılırsa sadece STUN kullanılır)
-    "TURN_KEY_ID": ""
+    "TURN_KEY_ID": "0937a6843e3964e9dcbd3c78e0c3b8d0",
+    // Son 31 günde izin verilen tahmini ses/görüntü trafiği (GB). Ücretsiz kota 1000 GB.
+    "USAGE_LIMIT_GB": "800"
   }
   // Gizli değerler (wrangler secret put ile):
   //   INVITE_CODE          -> kayıt olmak için davet kodu

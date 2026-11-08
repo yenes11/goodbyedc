@@ -12,9 +12,6 @@
     <form id="auth-form" class="auth-card">
       <h1>goodbyedc</h1>
       <p class="muted" id="auth-sub">Tekrar hoş geldin!</p>
-      <label>Sunucu adresi
-        <input id="auth-url" placeholder="https://goodbyedc.kullanici.workers.dev" required />
-      </label>
       <label>Kullanıcı adı
         <input id="auth-user" autocomplete="username" required />
       </label>
@@ -35,14 +32,18 @@
 
   <!-- Ana uygulama -->
   <div id="app" class="app hidden">
-    <nav id="servers" class="servers"></nav>
-
     <aside class="sidebar">
       <header class="server-header">
         <span id="server-name"></span>
-        <button id="server-delete" class="icon-btn" title="Sunucuyu sil">🗑</button>
       </header>
       <div id="channels" class="channels"></div>
+
+      <div id="update-bar" class="update-bar hidden">
+        <span>Yeni sürüm hazır</span>
+        <button id="btn-update">Güncelle</button>
+      </div>
+
+      <div id="usage" class="usage"></div>
 
       <div id="voice-panel" class="voice-panel hidden">
         <div>
@@ -50,17 +51,18 @@
           <div id="voice-channel-name" class="muted small"></div>
         </div>
         <div class="voice-actions">
-          <button id="btn-screen" class="icon-btn" title="Ekran paylaş">🖥</button>
-          <button id="btn-leave" class="icon-btn danger" title="Bağlantıyı kes">📞</button>
+          <button id="btn-screen" class="icon-btn" title="Ekran paylaş" data-icon="monitor"></button>
+          <button id="btn-leave" class="icon-btn danger" title="Bağlantıyı kes" data-icon="phoneOff"></button>
         </div>
       </div>
 
       <footer class="user-panel">
         <div class="avatar" id="me-avatar"></div>
         <div class="me-name" id="me-name"></div>
-        <button id="btn-mute" class="icon-btn" title="Sustur">🎙</button>
-        <button id="btn-deafen" class="icon-btn" title="Sağırlaştır">🎧</button>
-        <button id="btn-logout" class="icon-btn" title="Çıkış yap">⏻</button>
+        <button id="btn-mute" class="icon-btn" title="Sustur" data-icon="mic"></button>
+        <button id="btn-deafen" class="icon-btn" title="Sağırlaştır" data-icon="headphones"></button>
+        <button id="btn-check-update" class="icon-btn" title="Güncellemeleri denetle" data-icon="refresh"></button>
+        <button id="btn-logout" class="icon-btn" title="Çıkış yap" data-icon="logOut"></button>
       </footer>
     </aside>
 

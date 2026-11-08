@@ -1,0 +1,4 @@
+# libwebrtc'nin hazır Windows kütüphanesi C çalışma zamanını statik (/MT) kullanıyor.
+# Rust'ın da aynısını kullanması gerekiyor, yoksa bağlama aşamasında LNK2038 hatası çıkar.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

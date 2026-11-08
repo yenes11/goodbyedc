@@ -16,6 +16,8 @@ export interface Env {
   REALTIME_APP_TOKEN: string;
   TURN_KEY_ID?: string;
   TURN_KEY_TOKEN?: string;
+  /** Son 31 gündeki tahmini SFU trafiği için üst sınır (GB). Varsayılan 800. */
+  USAGE_LIMIT_GB?: string;
 }
 
 const CORS: Record<string, string> = {
@@ -54,6 +56,7 @@ interface VoiceInfo {
   tracks: string[]; // "mic", "screen"
   muted: boolean;
   deafened: boolean;
+  watching: string | null; // ekranını izlediği oturum id'si
 }
 
 interface Attachment {
@@ -66,6 +69,15 @@ const MAX_MESSAGE_LEN = 4000;
 const HISTORY_PAGE = 50;
 const PBKDF2_ITERATIONS = 100_000;
 const RTC_BASE = "https://rtc.live.cloudflare.com/v1";
+
+// ---- Kullanım tahmini (bilerek yüksek tutulur) ----
+// SFU'dan bir istemciye giden bir ses akışı: Opus + RTP/UDP/IP ek yükü.
+const AUDIO_BPS = 64_000;
+// Bir izleyiciye giden ekran görüntüsü: istemcideki 3 Mbps tavan + ek yük.
+const SCREEN_BPS = 3_300_000;
+const WINDOW_DAYS = 31;
+const USAGE_TICK_MS = 60_000;
+const LIMIT_MSG = "Son 31 günün ücretsiz trafik sınırına ulaşıldı. Sesli sohbet geçici olarak kapalı.";
 
 export class Hub extends DurableObject<Env> {
   sql: SqlStorage;
@@ -106,6 +118,14 @@ export class Hub extends DurableObject<Env> {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
+      CREATE TABLE IF NOT EXISTS usage_daily (
+        day TEXT PRIMARY KEY,
+        bytes REAL NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS rtc_sessions (
         session_id TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -242,6 +262,9 @@ export class Hub extends DurableObject<Env> {
     if (!this.env.REALTIME_APP_ID || !this.env.REALTIME_APP_TOKEN) {
       return json({ error: "Sunucuda REALTIME_APP_ID / REALTIME_APP_TOKEN ayarlanmamış" }, 500);
     }
+    if ((sub === "/sessions/new" || sub.endsWith("/tracks/new")) && this.overLimit()) {
+      return json({ error: LIMIT_MSG }, 403);
+    }
     const target = `${RTC_BASE}/apps/${this.env.REALTIME_APP_ID}${sub}`;
     const headers = { Authorization: `Bearer ${this.env.REALTIME_APP_TOKEN}`, "Content-Type": "application/json" };
 
@@ -291,6 +314,7 @@ export class Hub extends DurableObject<Env> {
       channels: this.sql.exec("SELECT id, server_id AS serverId, name, kind FROM channels ORDER BY id").toArray(),
       voice: this.voiceState(),
       online: this.onlineUsers(),
+      usage: this.usageInfo(),
     }));
     this.broadcast({ t: "presence", online: this.onlineUsers() });
     return new Response(null, { status: 101, webSocket: client });
@@ -391,15 +415,20 @@ export class Hub extends DurableObject<Env> {
       }
       case "voice_join": {
         if (!this.channelExists(msg.channelId, "voice")) return err("Ses kanalı bulunamadı");
+        if (this.overLimit()) {
+          reply({ t: "voice_disabled", error: LIMIT_MSG });
+          return;
+        }
         att.voice = {
           channelId: msg.channelId,
           sessionId: String(msg.sessionId),
           tracks: sanitizeTracks(msg.tracks),
           muted: !!msg.muted,
           deafened: !!msg.deafened,
+          watching: null,
         };
         ws.serializeAttachment(att);
-        this.broadcastVoice();
+        await this.broadcastVoice();
         return;
       }
       case "voice_update": {
@@ -407,32 +436,33 @@ export class Hub extends DurableObject<Env> {
         if (msg.tracks !== undefined) att.voice.tracks = sanitizeTracks(msg.tracks);
         if (msg.muted !== undefined) att.voice.muted = !!msg.muted;
         if (msg.deafened !== undefined) att.voice.deafened = !!msg.deafened;
+        if (msg.watching !== undefined) att.voice.watching = typeof msg.watching === "string" ? msg.watching : null;
         ws.serializeAttachment(att);
-        this.broadcastVoice();
+        await this.broadcastVoice();
         return;
       }
       case "voice_leave": {
         att.voice = null;
         ws.serializeAttachment(att);
-        this.broadcastVoice();
+        await this.broadcastVoice();
         return;
       }
     }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
-    this.onSocketGone(ws);
+    await this.onSocketGone(ws);
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
-    this.onSocketGone(ws);
+    await this.onSocketGone(ws);
   }
 
-  onSocketGone(ws: WebSocket) {
+  async onSocketGone(ws: WebSocket) {
     try {
       ws.close(1000, "bye");
     } catch {}
-    this.broadcastVoice(ws);
+    await this.broadcastVoice(ws);
     this.broadcast({ t: "presence", online: this.onlineUsers(ws) }, ws);
   }
 
@@ -464,8 +494,102 @@ export class Hub extends DurableObject<Env> {
     return [...map].map(([id, username]) => ({ id, username }));
   }
 
-  broadcastVoice(exclude?: WebSocket) {
-    this.broadcast({ t: "voice", voice: this.voiceState(exclude) }, exclude);
+  async broadcastVoice(exclude?: WebSocket) {
+    await this.updateUsage(exclude);
+    this.broadcast({ t: "voice", voice: this.voiceState(exclude), usage: this.usageInfo() }, exclude);
+  }
+
+  // ---------------------------------------------------------- kullanım
+
+  /** Dakikada bir: biriken trafiği yaz, sınırı kontrol et. */
+  async alarm(): Promise<void> {
+    await this.updateUsage();
+    if (this.voiceState().length) {
+      this.broadcast({ t: "voice", voice: this.voiceState(), usage: this.usageInfo() });
+    }
+  }
+
+  getKV(key: string): string | null {
+    const row = this.sql.exec("SELECT value FROM kv WHERE key = ?", key).toArray()[0];
+    return row ? (row.value as string) : null;
+  }
+
+  setKV(key: string, value: string) {
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", key, value);
+  }
+
+  /** Mevcut ses durumuna göre SFU'dan istemcilere giden tahmini bit/sn. */
+  computeRate(voice: Array<{ channelId: number; sessionId: string } & VoiceInfo>): number {
+    let bps = 0;
+    for (const p of voice) {
+      const same = voice.filter((o) => o.channelId === p.channelId && o.sessionId !== p.sessionId);
+      // p, kanaldaki herkesin mikrofonunu çeker.
+      bps += same.filter((o) => o.tracks.includes("mic")).length * AUDIO_BPS;
+      // p birinin ekranını izliyorsa.
+      if (p.watching && same.some((o) => o.sessionId === p.watching && o.tracks.includes("screen"))) {
+        bps += SCREEN_BPS;
+      }
+    }
+    return bps;
+  }
+
+  /** Son güncellemeden bu yana geçen trafiği ekler ve yeni hızı kaydeder. */
+  async updateUsage(exclude?: WebSocket) {
+    const now = Date.now();
+    const last = Number(this.getKV("usage_last") ?? now);
+    const rate = Number(this.getKV("usage_rate") ?? 0);
+    if (rate > 0 && now > last) {
+      const bytes = (rate / 8) * ((now - last) / 1000);
+      const day = new Date(now).toISOString().slice(0, 10);
+      this.sql.exec(
+        "INSERT INTO usage_daily (day, bytes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + excluded.bytes",
+        day, bytes,
+      );
+    }
+    this.setKV("usage_last", String(now));
+
+    let newRate = this.computeRate(this.voiceState(exclude));
+    if (newRate > 0 && this.overLimit()) {
+      this.disableVoice(exclude);
+      newRate = 0;
+    }
+    this.setKV("usage_rate", String(newRate));
+    if (newRate > 0 && (await this.ctx.storage.getAlarm()) === null) {
+      await this.ctx.storage.setAlarm(now + USAGE_TICK_MS);
+    }
+    this.sql.exec("DELETE FROM usage_daily WHERE day < ?", dayOffset(-40));
+  }
+
+  /** Sınır aşıldı: herkesi ses kanalından çıkar. */
+  disableVoice(exclude?: WebSocket) {
+    for (const s of this.sockets(exclude)) {
+      const a = s.deserializeAttachment() as Attachment | null;
+      if (a?.voice) {
+        a.voice = null;
+        s.serializeAttachment(a);
+      }
+    }
+    this.broadcast({ t: "voice_disabled", error: LIMIT_MSG }, exclude);
+  }
+
+  limitBytes(): number {
+    const gb = Number(this.env.USAGE_LIMIT_GB || 800);
+    return (Number.isFinite(gb) && gb > 0 ? gb : 800) * 1e9;
+  }
+
+  usedBytes(): number {
+    const row = this.sql
+      .exec("SELECT COALESCE(SUM(bytes), 0) AS b FROM usage_daily WHERE day > ?", dayOffset(-WINDOW_DAYS))
+      .one();
+    return row.b as number;
+  }
+
+  overLimit(): boolean {
+    return this.usedBytes() >= this.limitBytes();
+  }
+
+  usageInfo() {
+    return { usedGB: +(this.usedBytes() / 1e9).toFixed(2), limitGB: this.limitBytes() / 1e9 };
   }
 
   broadcast(data: unknown, exclude?: WebSocket) {
@@ -476,6 +600,10 @@ export class Hub extends DurableObject<Env> {
       } catch {}
     }
   }
+}
+
+function dayOffset(days: number): string {
+  return new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 }
 
 function sanitizeTracks(v: unknown): string[] {

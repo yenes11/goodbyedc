@@ -36,6 +36,8 @@ pub struct Shared {
     pub viewers: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Arayüze JPEG kareleri gönderen kanal.
     pub frame_sink: Mutex<Option<Channel<InvokeResponseBody>>>,
+    /// Arayüze ses seviyelerini (kim konuşuyor) gönderen kanal.
+    pub level_sink: Mutex<Option<Channel<serde_json::Value>>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -61,6 +63,7 @@ pub struct Call {
     /// "oturumId/trackAdı" -> mid
     pulled: HashMap<String, String>,
     shared: Arc<Shared>,
+    stats_task: JoinHandle<()>,
 }
 
 fn offer_options() -> OfferOptions {
@@ -103,11 +106,13 @@ impl Call {
         }
         factory.set_adm_recording_enabled(true);
         factory.set_adm_playout_enabled(true);
+        log_devices(&factory);
 
         let session_id = sfu.new_session().await?;
         let mic = factory.create_device_audio_track("mic");
         mic.set_enabled(!muted);
 
+        let stats_task = tauri::async_runtime::spawn(stats_loop(pc.clone(), shared.clone()));
         let call = Self {
             sfu,
             factory,
@@ -117,6 +122,7 @@ impl Call {
             screen: None,
             pulled: HashMap::new(),
             shared,
+            stats_task,
         };
         let tr = call.add_send_transceiver(MediaStreamTrack::Audio(mic), vec![])?;
         call.push_track(&tr, "mic").await.context("mikrofon gönderilemedi")?;
@@ -311,6 +317,7 @@ impl Call {
     }
 
     pub fn leave(mut self) {
+        self.stats_task.abort();
         self.screen = None; // yakalamayı durdurur
         for (_, h) in self.shared.viewers.lock().drain() {
             h.abort();
@@ -361,5 +368,54 @@ async fn view_screen(shared: Arc<Shared>, owner: String, track: RtcVideoTrack) {
         payload.extend_from_slice(id);
         payload.extend_from_slice(&jpeg);
         let _ = sink.send(InvokeResponseBody::Raw(payload));
+    }
+}
+
+fn log_devices(factory: &PeerConnectionFactory) {
+    let rec: Vec<String> = (0..factory.recording_devices().max(0) as u16).map(|i| factory.recording_device_name(i)).collect();
+    let play: Vec<String> = (0..factory.playout_devices().max(0) as u16).map(|i| factory.playout_device_name(i)).collect();
+    log::info!("mikrofonlar: {rec:?}");
+    log::info!("hoparlörler: {play:?}");
+    log::info!(
+        "kayıt hazır: {}, çalma hazır: {}",
+        factory.recording_is_initialized(),
+        factory.playout_is_initialized()
+    );
+}
+
+/// Her 250 ms'de ses seviyelerini ölçüp arayüze gönderir ("kim konuşuyor").
+/// Ayrıca birkaç saniyede bir gönderilen/alınan ses miktarını log'a yazar.
+async fn stats_loop(pc: PeerConnection, shared: Arc<Shared>) {
+    use libwebrtc::stats::RtcStats;
+    let mut tick: u32 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        tick += 1;
+        let Ok(stats) = pc.get_stats().await else { continue };
+
+        let mut me = 0.0f64;
+        let mut sent = 0u64;
+        let mut peers = serde_json::Map::new();
+        let mut recv = serde_json::Map::new();
+        let owners = shared.mid_owner.lock().clone();
+        for st in &stats {
+            match st {
+                RtcStats::MediaSource(m) if m.source.kind == "audio" => me = me.max(m.audio.audio_level),
+                RtcStats::OutboundRtp(o) if o.stream.kind == "audio" => sent += o.sent.bytes_sent,
+                RtcStats::InboundRtp(i) if i.stream.kind == "audio" => {
+                    if let Some(owner) = owners.get(&i.inbound.mid) {
+                        peers.insert(owner.clone(), json!(i.inbound.audio_level));
+                        recv.insert(owner.clone(), json!(i.inbound.bytes_received));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if tick % 20 == 0 {
+            log::info!("ses: mikrofon seviyesi {me:.3}, gönderilen {sent} B, alınan {recv:?}, seviyeler {peers:?}");
+        }
+        if let Some(sink) = shared.level_sink.lock().clone() {
+            let _ = sink.send(json!({ "me": me, "peers": peers, "sent": sent, "recv": recv }));
+        }
     }
 }

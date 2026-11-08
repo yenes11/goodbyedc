@@ -7,8 +7,34 @@ const invoke = tauri ? tauri.core.invoke : async () => { throw new Error("Tauri 
 
 const $ = (id) => document.getElementById(id);
 
+// Sunucu adresi sabit: herkes aynı Worker'a bağlanır.
+const BASE = "https://goodbyedc.my-turn-server.workers.dev";
+
+// İkonlar (Lucide, ISC lisansı). currentColor ile boyanır.
+const ICONS = {
+  mic: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>',
+  micOff: '<path d="M2 2l20 20"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 5"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><path d="M12 19v3"/>',
+  headphones: '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/>',
+  headphonesOff: '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/><path d="M2 2l20 20"/>',
+  logOut: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>',
+  monitor: '<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>',
+  window: '<rect width="20" height="16" x="2" y="4" rx="2"/><path d="M2 8h20"/><path d="M6 4v4"/><path d="M10 4v4"/>',
+  phoneOff: '<path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/><path d="M22 2 2 22"/>',
+  volume: '<path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>',
+  hash: '<path d="M4 9h16"/><path d="M4 15h16"/><path d="M10 3 8 21"/><path d="M16 3l-2 18"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+};
+
+function icon(name, size = 20) {
+  return `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+document.querySelectorAll("[data-icon]").forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
+
 const state = {
-  base: localStorage.getItem("base") || "",
+  base: BASE,
   token: localStorage.getItem("token") || "",
   me: null,
   servers: [],
@@ -22,6 +48,7 @@ const state = {
   muted: localStorage.getItem("muted") === "1",
   deafened: localStorage.getItem("deafened") === "1",
   watching: null,     // ekranını izlediğimiz oturum id'si
+  usage: null,        // {usedGB, limitGB}
 };
 
 // ---------------------------------------------------------------- yardımcılar
@@ -63,6 +90,7 @@ function modal(title, html, onOk, okText = "Tamam") {
   $("modal-title").textContent = title;
   $("modal-body").innerHTML = html;
   $("modal-ok").textContent = okText;
+  $("modal-ok").disabled = false;
   $("modal").classList.remove("hidden");
   const close = () => $("modal").classList.add("hidden");
   $("modal-cancel").onclick = close;
@@ -83,7 +111,6 @@ let registering = false;
 function showAuth() {
   $("app").classList.add("hidden");
   $("auth").classList.remove("hidden");
-  $("auth-url").value = state.base;
 }
 
 $("auth-toggle").onclick = (e) => {
@@ -99,7 +126,7 @@ $("auth-toggle").onclick = (e) => {
 $("auth-form").onsubmit = async (e) => {
   e.preventDefault();
   $("auth-error").textContent = "";
-  const base = $("auth-url").value.trim().replace(/\/+$/, "");
+  const base = BASE;
   const body = { username: $("auth-user").value, password: $("auth-pass").value };
   if (registering) body.invite = $("auth-invite").value;
   try {
@@ -110,9 +137,7 @@ $("auth-form").onsubmit = async (e) => {
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-    state.base = base;
     state.token = data.token;
-    localStorage.setItem("base", base);
     localStorage.setItem("token", data.token);
     start();
   } catch (err) {
@@ -191,16 +216,19 @@ function handle(m) {
       state.channels = m.channels;
       state.voice = m.voice;
       state.online = m.online;
+      state.usage = m.usage;
       $("me-name").textContent = m.me.username;
       $("me-avatar").outerHTML = `<div class="avatar" id="me-avatar" style="background:${colorFor(m.me.username)}">${esc(m.me.username[0].toUpperCase())}</div>`;
       // Yeniden bağlandıysak ses durumumuzu tekrar bildir.
       if (state.myVoice) {
         send({ t: "voice_join", ...state.myVoice, muted: state.muted, deafened: state.deafened });
+        if (state.watching) send({ t: "voice_update", watching: state.watching });
       }
       // Mesajları yeniden yükle (koptuğumuz sırada gelenler olabilir).
       state.messages.clear();
       if (!state.servers.find((s) => s.id === state.serverId)) state.serverId = state.servers[0]?.id ?? null;
       selectServer(state.serverId);
+      checkUpdate();
       break;
     }
     case "message": {
@@ -223,13 +251,11 @@ function handle(m) {
     }
     case "server_created":
       state.servers.push(m.server);
-      renderServers();
       break;
     case "server_deleted":
       state.servers = state.servers.filter((s) => s.id !== m.serverId);
       state.channels = state.channels.filter((c) => c.serverId !== m.serverId);
       if (state.serverId === m.serverId) selectServer(state.servers[0]?.id);
-      else renderServers();
       break;
     case "channel_created":
       state.channels.push(m.channel);
@@ -244,8 +270,13 @@ function handle(m) {
       break;
     case "voice":
       state.voice = m.voice;
+      if (m.usage) state.usage = m.usage;
       renderChannels();
       syncVoice();
+      break;
+    case "voice_disabled":
+      toast(m.error, true);
+      if (state.myVoice) queue(doLeave);
       break;
     case "presence":
       state.online = m.online;
@@ -258,33 +289,12 @@ function handle(m) {
 
 // ------------------------------------------------------------------ çizim
 
-function renderServers() {
-  const el = $("servers");
-  el.innerHTML =
-    state.servers
-      .map((s) => {
-        const initials = s.name.split(/\s+/).map((w) => w[0]).join("").slice(0, 3).toUpperCase();
-        return `<div class="server-icon ${s.id === state.serverId ? "active" : ""}" data-id="${s.id}" title="${esc(s.name)}">${esc(initials)}</div>`;
-      })
-      .join("") + `<div class="sep"></div><div class="server-icon add" id="add-server" title="Sunucu ekle">+</div>`;
-  el.querySelectorAll(".server-icon[data-id]").forEach((n) => (n.onclick = () => selectServer(Number(n.dataset.id))));
-  $("add-server").onclick = () =>
-    modal("Sunucu oluştur", `<input id="f-name" placeholder="Sunucu adı" maxlength="50" />`, (b) => {
-      const name = b.querySelector("#f-name").value.trim();
-      if (!name) return false;
-      send({ t: "create_server", name });
-    }, "Oluştur");
-  const srv = state.servers.find((s) => s.id === state.serverId);
-  $("server-name").textContent = srv ? srv.name : "";
-}
-
 function selectServer(id) {
   state.serverId = id;
   localStorage.setItem("serverId", id);
   const text = state.channels.filter((c) => c.serverId === id && c.kind === "text");
   const saved = Number(localStorage.getItem(`ch:${id}`));
   state.channelId = text.find((c) => c.id === saved)?.id ?? text[0]?.id ?? null;
-  renderServers();
   renderChannels();
   renderMain();
 }
@@ -301,25 +311,25 @@ function renderChannels() {
   const text = chans.filter((c) => c.kind === "text");
   const voice = chans.filter((c) => c.kind === "voice");
 
-  const chanRow = (c, icon) =>
+  const chanRow = (c, ic) =>
     `<div class="channel ${c.id === state.channelId ? "active" : ""}" data-id="${c.id}" data-kind="${c.kind}">
-       <span class="hash">${icon}</span><span class="name">${esc(c.name)}</span>
-       <button class="del" data-del="${c.id}" title="Kanalı sil">✕</button>
+       <span class="hash">${icon(ic, 18)}</span><span class="name">${esc(c.name)}</span>
+       <button class="del" data-del="${c.id}" title="Kanalı sil">${icon("x", 14)}</button>
      </div>`;
 
-  let html = `<div class="category"><span>Metin kanalları</span><button data-add="text" title="Kanal ekle">+</button></div>`;
-  html += text.map((c) => chanRow(c, "#")).join("");
-  html += `<div class="category"><span>Ses kanalları</span><button data-add="voice" title="Kanal ekle">+</button></div>`;
+  let html = `<div class="category"><span>Metin kanalları</span><button data-add="text" title="Kanal ekle">${icon("plus", 16)}</button></div>`;
+  html += text.map((c) => chanRow(c, "hash")).join("");
+  html += `<div class="category"><span>Ses kanalları</span><button data-add="voice" title="Kanal ekle">${icon("plus", 16)}</button></div>`;
   for (const c of voice) {
-    html += chanRow(c, "🔊");
+    html += chanRow(c, "volume");
     const users = state.voice.filter((v) => v.channelId === c.id);
     html += `<div class="voice-users">${users
       .map((u) => {
         const live = u.tracks.includes("screen");
         const isMe = u.userId === state.me?.id;
         const watching = state.watching === u.sessionId;
-        return `<div class="voice-user">${avatar(u.username)}<span>${esc(u.username)}</span>
-          <span class="flags">${u.muted ? "🔇" : ""}${u.deafened ? "🙉" : ""}
+        return `<div class="voice-user ${speaking.has(u.sessionId) ? "speaking" : ""}" data-sid="${esc(u.sessionId)}">${avatar(u.username)}<span>${esc(u.username)}</span>
+          <span class="flags">${u.deafened ? icon("headphonesOff", 14) : u.muted ? icon("micOff", 14) : ""}
           ${live ? `<span class="live ${watching ? "watching" : ""}" data-watch="${esc(u.sessionId)}" data-me="${isMe ? 1 : 0}"
               title="${isMe ? "Ekranını paylaşıyorsun" : "İzlemek için tıkla"}">CANLI</span>` : ""}</span></div>`;
       })
@@ -370,9 +380,16 @@ function renderChannels() {
     $("voice-channel-name").textContent = `${ch?.name ?? ""} / ${srv?.name ?? ""}`;
     $("btn-screen").classList.toggle("on", state.myVoice.tracks.includes("screen"));
   }
+  if (state.usage) {
+    const { usedGB, limitGB } = state.usage;
+    const u = $("usage");
+    u.textContent = `Ses/görüntü trafiği (31 gün): ${usedGB.toFixed(1)} / ${limitGB} GB`;
+    u.classList.toggle("warn", usedGB >= limitGB * 0.8);
+  }
   $("btn-mute").classList.toggle("off", state.muted);
   $("btn-deafen").classList.toggle("off", state.deafened);
-  $("btn-mute").textContent = state.muted ? "🔇" : "🎙";
+  $("btn-mute").innerHTML = icon(state.muted ? "micOff" : "mic");
+  $("btn-deafen").innerHTML = icon(state.deafened ? "headphonesOff" : "headphones");
   const srv = state.servers.find((s) => s.id === state.serverId);
   $("server-name").textContent = srv ? srv.name : "";
 }
@@ -385,7 +402,7 @@ function renderMain() {
   $("empty").classList.toggle("hidden", !!watchingUser || !!ch);
 
   if (watchingUser) {
-    $("channel-title").textContent = `🖥 ${watchingUser.username} ekranını paylaşıyor`;
+    $("channel-title").innerHTML = `${icon("monitor", 18)}<span>${esc(watchingUser.username)} ekranını paylaşıyor</span>`;
     $("stage-title").textContent = watchingUser.username;
     return;
   }
@@ -393,7 +410,7 @@ function renderMain() {
     $("channel-title").textContent = "";
     return;
   }
-  $("channel-title").textContent = `# ${ch.name}`;
+  $("channel-title").innerHTML = `${icon("hash", 20)}<span>${esc(ch.name)}</span>`;
   $("composer-input").placeholder = `#${ch.name} kanalına mesaj gönder`;
   if (!state.messages.has(ch.id)) {
     state.messages.set(ch.id, { list: [], more: true, loading: true });
@@ -450,14 +467,6 @@ $("composer").onsubmit = (e) => {
   input.value = "";
 };
 
-$("server-delete").onclick = () => {
-  const srv = state.servers.find((s) => s.id === state.serverId);
-  if (!srv) return;
-  modal("Sunucuyu sil", `<p>“${esc(srv.name)}” sunucusu, tüm kanalları ve mesajlarıyla silinecek. Emin misin?</p>`, () => {
-    send({ t: "delete_server", serverId: srv.id });
-  }, "Sil");
-};
-
 // -------------------------------------------------------------------- ses
 
 let voiceBusy = Promise.resolve();
@@ -487,6 +496,7 @@ function joinVoice(channelId) {
 
 async function doLeave() {
   await invoke("voice_leave");
+  speaking.clear();
   state.myVoice = null;
   state.watching = null;
   send({ t: "voice_leave" });
@@ -530,6 +540,7 @@ function watch(sessionId) {
     }
   }
   state.watching = sessionId;
+  send({ t: "voice_update", watching: sessionId });
   clearCanvas();
   renderChannels();
   renderMain();
@@ -585,26 +596,62 @@ $("btn-screen").onclick = async () => {
   if (!sources.length) {
     return toast("Paylaşılabilecek ekran bulunamadı. macOS'ta Sistem Ayarları > Gizlilik > Ekran Kaydı iznini kontrol et.", true);
   }
-  let selected = sources[0];
-  const html = sources
-    .map((s, i) => `<div class="source ${i === 0 ? "selected" : ""}" data-i="${i}">${s.kind === "screen" ? "🖥" : "🪟"} ${esc(s.title)}</div>`)
-    .join("");
+  const groups = {
+    screen: sources.filter((s) => s.kind === "screen"),
+    window: sources.filter((s) => s.kind !== "screen"),
+  };
+  let tab = groups.screen.length ? "screen" : "window";
+  let selected = groups[tab][0] ?? null;
+
+  const html = `
+    <div class="tabs">
+      <button class="tab" data-tab="screen">${icon("monitor", 16)}<span>Tüm ekran</span></button>
+      <button class="tab" data-tab="window">${icon("window", 16)}<span>Uygulamalar</span></button>
+    </div>
+    <div class="source-list"></div>`;
+
   modal("Ekran paylaş", html, () => {
+    if (!selected) return false;
+    const src = selected;
     queue(async () => {
-      const tracks = await invoke("screen_start", { id: selected.id, kind: selected.kind });
+      const tracks = await invoke("screen_start", { id: src.id, kind: src.kind });
       state.myVoice.tracks = tracks;
       send({ t: "voice_update", tracks });
       renderChannels();
     });
   }, "Paylaş");
-  $("modal-body").querySelectorAll(".source").forEach((n) => {
-    n.onclick = () => {
-      $("modal-body").querySelectorAll(".source").forEach((x) => x.classList.remove("selected"));
-      n.classList.add("selected");
-      selected = sources[Number(n.dataset.i)];
+
+  const body = $("modal-body");
+  const list = body.querySelector(".source-list");
+
+  function renderTab() {
+    body.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    const items = groups[tab];
+    if (!selected || !items.includes(selected)) selected = items[0] ?? null;
+    list.innerHTML = items.length
+      ? items
+          .map((s, i) => `<div class="source ${s === selected ? "selected" : ""}" data-i="${i}">${icon(tab === "screen" ? "monitor" : "window", 18)}<span>${esc(s.title)}</span></div>`)
+          .join("")
+      : `<p class="muted small">${tab === "screen" ? "Ekran bulunamadı." : "Açık uygulama penceresi bulunamadı."}</p>`;
+    list.querySelectorAll(".source").forEach((n) => {
+      n.onclick = () => {
+        list.querySelectorAll(".source").forEach((x) => x.classList.remove("selected"));
+        n.classList.add("selected");
+        selected = items[Number(n.dataset.i)];
+      };
+      n.ondblclick = () => $("modal-ok").click();
+    });
+    $("modal-ok").disabled = !selected;
+  }
+
+  body.querySelectorAll(".tab").forEach((b) => {
+    b.onclick = () => {
+      tab = b.dataset.tab;
+      selected = null;
+      renderTab();
     };
-    n.ondblclick = () => $("modal-ok").click();
   });
+  renderTab();
 };
 
 // İzlenen ekranın kareleri Rust'tan JPEG olarak gelir.
@@ -639,6 +686,71 @@ if (tauri) {
   invoke("screen_subscribe", { channel: frames });
 }
 
+// ------------------------------------------------------ kim konuşuyor
+// Rust tarafı 250 ms'de bir ses seviyelerini gönderir (0..1).
+const SPEAK_LEVEL = 0.02;
+const speaking = new Set();
+
+function applySpeaking(levels) {
+  const now = new Set();
+  if (state.myVoice) {
+    if (!state.muted && levels.me > SPEAK_LEVEL) now.add(state.myVoice.sessionId);
+    for (const [sid, lvl] of Object.entries(levels.peers || {})) if (lvl > SPEAK_LEVEL) now.add(sid);
+  }
+  speaking.clear();
+  now.forEach((x) => speaking.add(x));
+  document.querySelectorAll(".voice-user[data-sid]").forEach((el) => el.classList.toggle("speaking", speaking.has(el.dataset.sid)));
+}
+
+if (tauri) {
+  const levels = new tauri.core.Channel();
+  levels.onmessage = applySpeaking;
+  invoke("levels_subscribe", { channel: levels });
+}
+
+// ------------------------------------------------------------ güncelleme
+// Yeni bir sürüm yayınlandıysa "Güncelle" düğmesi çıkar.
+
+let updateTimer = null;
+
+/** manual: kullanıcı düğmeye bastıysa sonucu her durumda bildir. */
+async function checkUpdate(manual = false) {
+  if (!tauri) return;
+  clearTimeout(updateTimer);
+  updateTimer = setTimeout(checkUpdate, 30 * 60 * 1000);
+  const btn = $("btn-check-update");
+  btn.classList.add("spin");
+  try {
+    const r = await invoke("update_check");
+    $("update-bar").classList.toggle("hidden", !r.available);
+    if (manual) {
+      if (!r.supported) toast("Bu sürüm elle derlendiği için otomatik güncellenmiyor");
+      else if (!r.available) toast("Uygulama güncel");
+    }
+  } catch (e) {
+    if (manual) toast(`Güncelleme denetlenemedi: ${e}`, true);
+    else console.warn("güncelleme kontrolü:", e);
+  } finally {
+    btn.classList.remove("spin");
+  }
+}
+
+$("btn-check-update").onclick = () => checkUpdate(true);
+
+$("btn-update").onclick = async () => {
+  const btn = $("btn-update");
+  btn.disabled = true;
+  btn.textContent = "İndiriliyor…";
+  try {
+    // Başarılı olursa uygulama kendini yeniden başlatır.
+    await invoke("update_apply");
+  } catch (e) {
+    toast(`Güncellenemedi: ${e}`, true);
+    btn.disabled = false;
+    btn.textContent = "Güncelle";
+  }
+};
+
 // ----------------------------------------------------------------- başlat
 
 function start() {
@@ -647,5 +759,6 @@ function start() {
   connect();
 }
 
-if (state.token && state.base) start();
+localStorage.removeItem("base");
+if (state.token) start();
 else showAuth();

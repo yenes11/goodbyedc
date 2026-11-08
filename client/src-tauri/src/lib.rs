@@ -1,5 +1,6 @@
 mod screen;
 mod sfu;
+mod update;
 mod voice;
 
 use std::sync::Arc;
@@ -120,9 +121,32 @@ fn screen_subscribe(state: State<'_, AppState>, channel: Channel<InvokeResponseB
     *state.shared.frame_sink.lock() = Some(channel);
 }
 
+/// Arayüz, ses seviyelerini (kim konuşuyor) bu kanaldan alır.
+#[tauri::command]
+fn levels_subscribe(state: State<'_, AppState>, channel: Channel<serde_json::Value>) {
+    *state.shared.level_sink.lock() = Some(channel);
+}
+
+/// Yeni sürüm var mı? (Geliştirme sürümünde hep "yok" döner.)
+#[tauri::command]
+async fn update_check() -> CmdResult<update::Check> {
+    update::check().await.map_err(|e| format!("{e:#}"))
+}
+
+/// Yeni sürümü indirip kurar ve uygulamayı yeniden başlatır.
+#[tauri::command]
+async fn update_apply(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    update::apply().await.map_err(|e| format!("{e:#}"))?;
+    if let Some(call) = state.call.lock().await.take() {
+        call.leave();
+    }
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("goodbyedc=info")).init();
+    update::startup();
 
     tauri::Builder::default()
         .manage(AppState {
@@ -140,6 +164,9 @@ pub fn run() {
             screen_start,
             screen_stop,
             screen_subscribe,
+            levels_subscribe,
+            update_check,
+            update_apply,
         ])
         .run(tauri::generate_context!())
         .expect("uygulama başlatılamadı");
