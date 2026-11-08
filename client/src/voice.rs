@@ -87,7 +87,7 @@ pub fn level_db(level: f32) -> f32 {
 }
 
 /// Ses eşiği geçtikten sonra mikrofonun açık kalma süresi (kelime sonları kesilmesin).
-const GATE_HOLD: Duration = Duration::from_millis(400);
+const GATE_HOLD: Duration = Duration::from_millis(600);
 
 /// Call ile paylaşılan, WebRTC callback'lerinden de erişilen durum.
 #[derive(Default)]
@@ -583,8 +583,20 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, shared: Arc<Shared>)
         let db = level_db(me as f32);
         let gate = *shared.gate.lock();
         // Gürültü tabanı: aşağı hızlı, yukarı yavaş iner/çıkar (konuşma tabanı yükseltmesin).
-        noise_db = if db < noise_db { noise_db + (db - noise_db) * 0.3 } else { noise_db + (db - noise_db) * 0.01 };
-        let auto_threshold = (noise_db + 14.0).clamp(-60.0, -20.0);
+        // Gürültü tabanı: aşağı hızlı iner; yukarı yalnızca konuşulmuyorken (eşik kapalıyken)
+        // ve çok yavaş çıkar. Böylece uzun konuşmalar "gürültü" sanılıp eşiği yükseltmez.
+        let speaking_now = open_until.is_some_and(|t| Instant::now() < t);
+        if tick <= 20 {
+            // İlk saniye: odanın gürültüsünü doğrudan ölç (en düşük seviye).
+            noise_db = if tick == 1 { db } else { noise_db.min(db) };
+        } else if db < noise_db {
+            noise_db += (db - noise_db) * 0.3;
+        } else {
+            // Sessizken ~25 sn'de, konuşurken ~2 dk'da uyum sağlar.
+            noise_db += (db - noise_db) * if speaking_now { 0.0004 } else { 0.002 };
+        }
+        // Konuşma neredeyse her zaman -35 dB'nin üstündedir; eşik bunu geçmesin.
+        let auto_threshold = (noise_db + 12.0).clamp(-60.0, -38.0);
         let threshold = if gate.auto { auto_threshold } else { gate.threshold_db };
         let now = Instant::now();
         if db >= threshold {
