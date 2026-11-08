@@ -132,7 +132,10 @@ pub fn window_controls(ui: &mut Ui, height: f32) {
         (if maximized { ph::COPY } else { ph::SQUARE }, if maximized { "Önceki boyut" } else { "Büyüt" }, 1),
         (ph::X, "Kapat", 2),
     ];
-    for (icon, tip, kind) in buttons {
+    // Sağdan sola düzende ilk eklenen en sağa gelir: Kapat en sağda kalsın diye sırayı çevir.
+    let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
+    let order: Vec<_> = if rtl { buttons.into_iter().rev().collect() } else { buttons.into_iter().collect() };
+    for (icon, tip, kind) in order {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, height), Sense::click());
         let (bg, fg) = match (kind, resp.hovered()) {
             (2, true) => (Color32::from_rgb(0xe8, 0x11, 0x23), Color32::WHITE),
