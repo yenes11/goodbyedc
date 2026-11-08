@@ -93,6 +93,7 @@ pub struct Backend {
 
 impl Backend {
     pub fn start(rt: &tokio::runtime::Runtime, base: String) -> Self {
+        crate::voice::set_runtime(rt.handle().clone());
         let shared = Arc::new(Shared::default());
         let (ev_tx, ev_rx) = mpsc::channel();
         let (tx, rx) = unbounded_channel();

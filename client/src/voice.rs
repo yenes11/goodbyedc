@@ -25,6 +25,23 @@ use crate::sfu::{Sdp, Sfu};
 /// Ekran izlerken arayüze aktarılan en yüksek kare hızı.
 const VIEW_FPS: u64 = 30;
 
+/// Arka plan görevlerinin çalıştığı tokio çalışma ortamı.
+/// WebRTC geri çağrıları (on_track gibi) kendi iş parçacıklarında çalışır; oradan
+/// `tokio::spawn` çağrılırsa program çöker. Bu yüzden görevler bu tutamaçla başlatılır.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+pub fn set_runtime(handle: tokio::runtime::Handle) {
+    let _ = RUNTIME.set(handle);
+}
+
+fn spawn<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    RUNTIME.get().expect("tokio çalışma ortamı ayarlanmadı").spawn(fut)
+}
+
 /// İzlenen ekranın son karesi.
 pub struct ScreenFrame {
     /// Ekranı paylaşanın oturum id'si.
@@ -137,7 +154,7 @@ impl Call {
         let mic = factory.create_device_audio_track("mic");
         mic.set_enabled(!muted);
 
-        let stats_task = tokio::spawn(stats_loop(pc.clone(), shared.clone()));
+        let stats_task = spawn(stats_loop(pc.clone(), shared.clone()));
         let call = Self {
             sfu,
             factory,
@@ -368,7 +385,7 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
         MediaStreamTrack::Video(t) => {
             let owner = shared.mid_owner.lock().get(&mid).cloned().unwrap_or_default();
             let shared2 = shared.clone();
-            let handle = tokio::spawn(view_screen(shared2, owner, t));
+            let handle = spawn(view_screen(shared2, owner, t));
             if let Some(old) = shared.viewers.lock().insert(mid, handle) {
                 old.abort();
             }
