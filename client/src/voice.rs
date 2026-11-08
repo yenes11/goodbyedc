@@ -149,6 +149,8 @@ pub struct Call {
     last_sync: (Vec<Participant>, Option<String>),
     /// Takıldığı için yeniden çekilen track'lerin son deneme anı.
     repulled: HashMap<String, Instant>,
+    /// SFU'da kapatılamamış (susturulmuş) track'lerin mid'leri.
+    zombies: HashSet<String>,
     shared: Arc<Shared>,
     stats_task: JoinHandle<()>,
 }
@@ -229,6 +231,7 @@ impl Call {
             pulled: HashMap::new(),
             last_sync: (Vec::new(), None),
             repulled: HashMap::new(),
+            zombies: HashSet::new(),
             shared,
             stats_task,
         };
@@ -301,7 +304,12 @@ impl Call {
         self.shared.mid_owner.lock().insert(mid.clone(), remote_session.to_string());
         if res.requires_immediate_renegotiation {
             if let Some(offer) = &res.session_description {
-                self.answer_offer(offer).await?;
+                if let Err(e) = self.answer_offer(offer).await {
+                    // Yarım kalan çekme: SFU'da açık kalırsa sonraki denemeyle sesi iki kez duyarız.
+                    // Önce susturup kapatmayı dene; olmazsa sonra tekrar denenir.
+                    self.drop_mid(&mid).await;
+                    return Err(e);
+                }
             }
         }
         self.pulled.insert(format!("{remote_session}/{track}"), mid);
@@ -310,11 +318,29 @@ impl Call {
 
     async fn unpull(&mut self, key: &str) -> Result<()> {
         let Some(mid) = self.pulled.remove(key) else { return Ok(()) };
-        if let Some(h) = self.shared.viewers.lock().remove(&mid) {
+        self.drop_mid(&mid).await;
+        Ok(())
+    }
+
+    /// Bir uzak track'i susturur, yerel kayıtlardan siler ve SFU'da kapatır.
+    /// Kapatılamazsa `zombies` listesine eklenir ve sonra yeniden denenir.
+    async fn drop_mid(&mut self, mid: &str) {
+        if let Some(t) = self.shared.audio_tracks.lock().remove(mid) {
+            t.set_enabled(false);
+        }
+        if let Some(h) = self.shared.viewers.lock().remove(mid) {
             h.abort();
         }
-        self.shared.mid_owner.lock().remove(&mid);
-        self.shared.audio_tracks.lock().remove(&mid);
+        self.shared.mid_owner.lock().remove(mid);
+        if let Err(e) = self.close_mid(mid).await {
+            log::warn!("track kapatılamadı ({mid}), sonra yeniden denenecek: {e:#}");
+            self.zombies.insert(mid.to_string());
+        } else {
+            self.zombies.remove(mid);
+        }
+    }
+
+    async fn close_mid(&self, mid: &str) -> Result<()> {
         let res = self
             .sfu
             .tracks_close(&self.session_id, json!({ "tracks": [{ "mid": mid }], "force": true }))
@@ -373,6 +399,19 @@ impl Call {
     /// Düzenli bakım: takılmış ses track'lerini kapatıp yeniden çeker ve
     /// daha önce çekilemeyen track'leri yeniden dener.
     pub async fn heal(&mut self) {
+        // Kapatılamamış track'leri yeniden kapatmayı dene.
+        let zombies: Vec<String> = self.zombies.iter().cloned().collect();
+        for mid in zombies {
+            self.drop_mid(&mid).await;
+        }
+        // Hiçbir çekmeye ait olmayan ses track'leri (sahipsiz kopyalar): sustur ve kapat.
+        let live: HashSet<String> = self.pulled.values().cloned().collect();
+        let orphans: Vec<String> =
+            self.shared.audio_tracks.lock().keys().filter(|m| !live.contains(*m)).cloned().collect();
+        for mid in orphans {
+            log::warn!("sahipsiz ses track'i kapatılıyor: {mid}");
+            self.drop_mid(&mid).await;
+        }
         let stalled: Vec<String> = self.shared.stalled.lock().drain().collect();
         for mid in stalled {
             let Some(key) = self.pulled.iter().find(|(_, m)| **m == mid).map(|(k, _)| k.clone()) else { continue };
@@ -381,10 +420,7 @@ impl Call {
             }
             log::warn!("{key} sesinden bir süredir veri gelmiyor, yeniden çekiliyor");
             self.repulled.insert(key.clone(), Instant::now());
-            if let Err(e) = self.unpull(&key).await {
-                log::warn!("takılan track kapatılamadı {key}: {e:#}");
-                self.pulled.remove(&key);
-            }
+            let _ = self.unpull(&key).await;
         }
         let (participants, watch) = self.last_sync.clone();
         self.sync(&participants, watch.as_deref()).await;
@@ -400,10 +436,9 @@ impl Call {
 
     pub fn set_deafened(&self, deafened: bool) {
         self.shared.deafened.store(deafened, Ordering::Relaxed);
-        for r in self.pc.receivers() {
-            if let Some(MediaStreamTrack::Audio(t)) = r.track() {
-                t.set_enabled(!deafened);
-            }
+        // Yalnızca takip edilen ses track'leri: susturulmuş kopyalar yeniden açılmasın.
+        for t in self.shared.audio_tracks.lock().values() {
+            t.set_enabled(!deafened);
         }
     }
 
@@ -482,6 +517,16 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
             // Ses, platform ADM üzerinden otomatik çalınır.
             if shared.deafened.load(Ordering::Relaxed) {
                 t.set_enabled(false);
+            }
+            // Aynı kişiden önceden gelen ses varsa (kopya) sustur; bakım döngüsü kapatır.
+            let owners = shared.mid_owner.lock().clone();
+            if let Some(owner) = owners.get(&mid) {
+                for (m, old) in shared.audio_tracks.lock().iter() {
+                    if m != &mid && owners.get(m) == Some(owner) {
+                        log::warn!("{owner} için ikinci ses track'i geldi, eskisi ({m}) susturuldu");
+                        old.set_enabled(false);
+                    }
+                }
             }
             // Yükseklik ayarı hassasiyet döngüsünde uygulanır (WebRTC iş parçacığını bekletmemek için).
             shared.audio_tracks.lock().insert(mid, t);
