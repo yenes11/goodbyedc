@@ -165,8 +165,8 @@ pub fn setup_style(ctx: &egui::Context) {
         v.code_bg_color = BG_ELEV;
         v.hyperlink_color = ACCENT;
         v.selection.bg_fill = ACCENT.gamma_multiply(0.45);
-        // Odaklanan input: HeroUI'de çerçeve yok; hafif bir mavi kenar yeterli.
-        v.selection.stroke = Stroke::new(1.5, ACCENT.gamma_multiply(0.7));
+        // Odaklanan input'ta çerçeve (outline) yok.
+        v.selection.stroke = Stroke::NONE;
         v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
 
         // Inputlar (ve egui'nin kendi çizdiği diğer öğeler) hap şeklinde.

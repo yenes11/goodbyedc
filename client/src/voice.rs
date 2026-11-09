@@ -61,6 +61,8 @@ pub struct Levels {
     pub transmitting: bool,
     /// Otomatik modda o anki eşik (dB).
     pub auto_threshold_db: f32,
+    /// Cloudflare sunucusuna gidiş-dönüş süresi (ms), ölçülebildiyse.
+    pub rtt_ms: Option<f32>,
     pub peers: HashMap<String, f32>,
 }
 
@@ -717,6 +719,7 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
 
         let mut me = 0.0f64;
         let mut sent = 0u64;
+        let mut rtt: Option<f64> = None;
         let mut peers = serde_json::Map::new();
         let mut recv = serde_json::Map::new();
         let owners = shared.mid_owner.lock().clone();
@@ -727,6 +730,10 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
             match st {
                 RtcStats::MediaSource(m) if m.source.kind == "audio" => me = me.max(m.audio.audio_level),
                 RtcStats::OutboundRtp(o) if o.stream.kind == "audio" => sent += o.sent.bytes_sent,
+                // Seçili bağlantı çiftinin gidiş-dönüş süresi (ICE bağlantı kontrollerinden; ek trafik yok).
+                RtcStats::CandidatePair(c) if c.candidate_pair.nominated && c.candidate_pair.current_round_trip_time > 0.0 => {
+                    rtt = Some(c.candidate_pair.current_round_trip_time * 1000.0);
+                }
                 RtcStats::InboundRtp(i) if i.stream.kind == "audio" => {
                     bytes_now.insert(i.inbound.mid.clone(), i.inbound.bytes_received);
                     if let Some(owner) = owners.get(&i.inbound.mid) {
@@ -812,6 +819,7 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
             lv.me = level;
             lv.transmitting = mic_on;
             lv.auto_threshold_db = auto_threshold;
+            lv.rtt_ms = rtt.map(|r| r as f32).or(lv.rtt_ms);
             lv.peers = peers.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect();
         }
         shared.request_repaint();

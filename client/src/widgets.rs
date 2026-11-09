@@ -12,10 +12,6 @@ pub enum Tone {
     Normal,
     /// Kapalı (ör. mikrofon susturulmuş): kırmızı
     Off,
-    /// Açık (ör. ekran paylaşılıyor): yeşil
-    On,
-    /// Tehlikeli işlem: üzerine gelince kırmızı zemin
-    Danger,
 }
 
 /// Kare ikon düğmesi.
@@ -26,11 +22,8 @@ pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, tone: Tone) -> Respon
     let rect = scaled(rect, s);
     let hovered = resp.hovered();
     let (bg, fg) = match tone {
-        Tone::Danger if hovered => (RED, Color32::WHITE),
-        Tone::On => (GREEN.gamma_multiply(0.15), GREEN),
         Tone::Off => (if hovered { HOVER } else { Color32::TRANSPARENT }, RED),
         _ if hovered => (HOVER, TEXT_STRONG),
-        Tone::Danger => (Color32::TRANSPARENT, TEXT),
         _ => (Color32::TRANSPARENT, MUTED),
     };
     let p = ui.painter();
@@ -62,8 +55,10 @@ pub fn accent_button(ui: &mut Ui, text: &str, width: f32, enabled: bool, loading
 }
 
 /// Kırmızı (tehlikeli işlem) düğme.
+/// HeroUI "danger" rengi: lab(50.91% 62.27 37.59) = #DB3B3E.
+/// Üzerine gelince oklab'da %10 beyazla karışır (#E15451).
 pub fn danger_button(ui: &mut Ui, text: &str, width: f32) -> Response {
-    solid_button(ui, text, width, true, false, RED, Color32::from_rgb(0xf5, 0x3d, 0x7f))
+    solid_button(ui, text, width, true, false, Color32::from_rgb(0xdb, 0x3b, 0x3e), Color32::from_rgb(0xe1, 0x54, 0x51))
 }
 
 pub const BUTTON_H: f32 = 36.0;
@@ -376,34 +371,85 @@ pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, edita
     resp
 }
 
-/// HeroUI modal başlığı: solda daire içinde ikon, sağ üstte kapatma düğmesi,
-/// altında büyük başlık ve soluk açıklama. Kapatma düğmesine basıldıysa `true`.
-pub fn modal_header(ui: &mut Ui, icon: &str, title: &str, desc: &str, danger: bool) -> bool {
+/// HeroUI modal başlığı: solda büyük başlık, sağ üstte daire kapatma düğmesi,
+/// altında soluk açıklama. Kapatma düğmesine basıldıysa `true`.
+pub fn modal_header(ui: &mut Ui, title: &str, desc: &str) -> bool {
+    let desc = (!desc.is_empty()).then(|| egui::RichText::new(desc).size(14.5).color(MUTED).into());
+    modal_header_rich(ui, title, desc)
+}
+
+/// Açıklaması biçimli (ör. kalın kelimeli) modal başlığı.
+pub fn modal_header_rich(ui: &mut Ui, title: &str, desc: Option<egui::WidgetText>) -> bool {
     let mut close = false;
     let w = ui.available_width();
-    ui.allocate_ui_with_layout(egui::vec2(w, 52.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
-        let (bg, fg) = if danger { (RED.gamma_multiply(0.18), RED) } else { (HOVER, TEXT_STRONG) };
-        ui.painter().circle_filled(rect.center(), 26.0, bg);
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(24.0), fg);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    ui.allocate_ui_with_layout(egui::vec2(w, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.label(egui::RichText::new(title).font(bold_font(20.0)).color(TEXT_STRONG));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
             let s = press_scale(ui, &resp);
             let bg = if resp.hovered() { ACTIVE } else { HOVER };
-            ui.painter().circle_filled(rect.center(), 17.0 * s, bg);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, ph::X, icon_font(16.0 * s), MUTED);
+            ui.painter().circle_filled(rect.center(), 16.0 * s, bg);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, ph::X, icon_font(15.0 * s), MUTED);
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             close = resp.on_hover_text("Kapat").clicked();
         });
     });
-    ui.add_space(18.0);
-    ui.label(egui::RichText::new(title).font(bold_font(21.0)).color(TEXT_STRONG));
-    if !desc.is_empty() {
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(egui::RichText::new(desc).size(14.5).color(MUTED)).wrap());
+    if let Some(d) = desc {
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(d).wrap());
     }
-    ui.add_space(18.0);
+    ui.add_space(20.0);
     close
+}
+
+/// Yazıya göre düğme genişliği (iki yanda 18 px boşluk).
+pub fn button_width(ui: &Ui, text: &str) -> f32 {
+    let g = ui.painter().layout_no_wrap(text.to_string(), font(14.0), Color32::WHITE);
+    (g.size().x + 36.0).max(80.0)
+}
+
+/// Etiketli hap düğme (ses panelindeki "Ekran", "Ses" gibi): ikon + yazı, dolgulu.
+/// `on` iken yeşil tonlu; `loading` iken ikonun yerinde dönen gösterge.
+pub fn action_pill(ui: &mut Ui, icon: &str, label: &str, width: f32, on: bool, loading: bool) -> Response {
+    let (slot, resp) = ui.allocate_exact_size(egui::vec2(width, 32.0), if loading { Sense::hover() } else { Sense::click() });
+    let s = if loading { 1.0 } else { press_scale(ui, &resp) };
+    let rect = scaled(slot, s);
+    let (bg, fg) = if on {
+        (GREEN.gamma_multiply(if resp.hovered() { 0.26 } else { 0.16 }), GREEN)
+    } else if resp.hovered() {
+        (ACTIVE, TEXT_STRONG)
+    } else {
+        (HOVER, TEXT)
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(16), bg);
+    let text = p.layout_no_wrap(label.to_string(), bold_font(13.0 * s), fg);
+    let total = 16.0 + 6.0 + text.size().x;
+    let x = rect.center().x - total / 2.0;
+    let icon_c = egui::pos2(x + 8.0, rect.center().y);
+    if loading {
+        spin(ui, Rect::from_center_size(icon_c, Vec2::splat(14.0)), fg);
+    } else {
+        p.text(icon_c, Align2::CENTER_CENTER, icon, icon_font(15.0 * s), fg);
+    }
+    p.galley(egui::pos2(x + 22.0, rect.center().y - text.size().y / 2.0), text, fg);
+    if !loading && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// Kırmızı tonlu daire düğme (bağlantıyı kes): her zaman kırmızı, üzerine gelince dolu kırmızı.
+pub fn danger_circle_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
+    let (slot, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let rect = scaled(slot, press_scale(ui, &resp));
+    let (bg, fg) = if resp.hovered() { (RED, Color32::WHITE) } else { (RED.gamma_multiply(0.18), RED) };
+    ui.painter().circle_filled(rect.center(), rect.width() / 2.0, bg);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(17.0), fg);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tooltip)
 }
