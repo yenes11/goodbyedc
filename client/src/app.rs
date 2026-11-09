@@ -1,6 +1,7 @@
 //! Uygulama durumu ve arayüz (egui).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -99,6 +100,10 @@ pub struct App {
     speaking: HashSet<String>,
     /// Son ölçülen ses seviyeleri (ayarlar penceresindeki gösterge için).
     levels: Levels,
+    /// Ayarlardaki mikrofon testi ("kendi sesini duy") açıksa.
+    mic_test: Option<crate::mictest::MicTest>,
+    /// Mikrofon testinin son ölçtüğü seviye (0..1).
+    mic_test_level: f32,
 
     modal: Option<Modal>,
     modal_focus: bool,
@@ -166,6 +171,8 @@ impl App {
             screen_tex: None,
             speaking: HashSet::new(),
             levels: Levels::default(),
+            mic_test: None,
+            mic_test_level: 0.0,
             modal: None,
             modal_focus: false,
             toast: None,
@@ -349,6 +356,19 @@ impl App {
         // Ses ayarlarını ses döngüsüne ilet (hassasiyet ve kişilere özel yükseklik).
         *self.backend.shared.gate.lock() =
             Gate { auto: self.settings.input_auto, threshold_db: self.settings.input_threshold_db };
+        self.backend.shared.music_normalize.store(self.settings.music_normalize, Ordering::Relaxed);
+
+        // Mikrofon testi yalnızca ayarlar penceresi açıkken çalışır.
+        if !matches!(self.modal, Some(Modal::Settings)) {
+            self.mic_test = None;
+        }
+        if let Some(t) = &self.mic_test {
+            // Ölçüm tepe değer; gösterge yumuşak düşsün.
+            self.mic_test_level = t.take_level().max(self.mic_test_level * 0.8);
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else {
+            self.mic_test_level = 0.0;
+        }
         {
             let mut vols: HashMap<String, f32> = self
                 .voice
@@ -865,7 +885,7 @@ impl App {
                                 .size(11.5)
                                 .color(if warn { RED } else { MUTED }),
                         )
-                        .on_hover_text("Son 31 gündeki ses/görüntü trafiği (Cloudflare ücretsiz kotası)");
+                        .on_hover_text(usage_tooltip(&u));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(crate::update::version_label()).size(11.5).color(MUTED));
@@ -1417,6 +1437,22 @@ impl App {
                                 }
                             }
                         });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Sesi dengele").color(TEXT));
+                                ui.label(
+                                    RichText::new("Uygulamadaki ses kısık olsa da herkese aynı yükseklikte gider.")
+                                        .size(12.0)
+                                        .color(MUTED),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::toggle(ui, &mut self.settings.music_normalize).changed() {
+                                    self.settings.save();
+                                }
+                            });
+                        });
                         ui.add_space(8.0);
                         ui.label(
                             RichText::new("İpucu: hoparlör kullanıyorsan müzik mikrofonuna da girebilir; kulaklık en iyisi.")
@@ -1451,7 +1487,14 @@ impl App {
                         });
                         ui.add_space(8.0);
                         let in_voice = self.my_voice.is_some();
-                        let level = if in_voice { level_db(self.levels.me) } else { -100.0 };
+                        let testing = self.mic_test.is_some();
+                        let level = if testing {
+                            level_db(self.mic_test_level)
+                        } else if in_voice {
+                            level_db(self.levels.me)
+                        } else {
+                            -100.0
+                        };
                         let auto = self.settings.input_auto;
                         let mut th = if auto { self.levels.auto_threshold_db.min(-1.0) } else { self.settings.input_threshold_db };
                         if auto && !in_voice {
@@ -1465,15 +1508,46 @@ impl App {
                             self.settings.save();
                         }
                         ui.add_space(6.0);
-                        let hint = if !in_voice {
-                            "Mikrofon seviyesini görmek için bir ses kanalına katıl.".to_string()
+                        let hint = if !in_voice && !testing {
+                            "Mikrofon seviyesini görmek için testi başlat ya da bir ses kanalına katıl.".to_string()
+                        } else if auto && !in_voice {
+                            "Otomatik eşik, ses kanalına katılınca odanın gürültüsüne göre belirlenir.".to_string()
                         } else if auto {
                             "Arka plan gürültüsüne göre eşik kendiliğinden ayarlanıyor.".to_string()
                         } else {
                             format!("Eşik: {th:.0} dB. Çizginin sağına geçen sesler iletilir.")
                         };
                         ui.label(RichText::new(hint).size(12.5).color(MUTED));
-                        ui.add_space(4.0);
+                        ui.add_space(18.0);
+                        widgets::field_label(ui, "Mikrofon testi");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Kendi sesini duy").color(TEXT));
+                                ui.label(
+                                    RichText::new("Sesin kulaklığından geri çalınır. Yankı olmasın diye kulaklık tak.")
+                                        .size(12.0)
+                                        .color(MUTED),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let mut on = testing;
+                                if widgets::toggle(ui, &mut on).changed() {
+                                    if on {
+                                        match crate::mictest::MicTest::start() {
+                                            Ok(t) => self.mic_test = Some(t),
+                                            Err(e) => {
+                                                log::warn!("mikrofon testi başlatılamadı: {e:#}");
+                                                self.toast(format!("Mikrofon testi başlatılamadı: {e}"), true);
+                                            }
+                                        }
+                                    } else {
+                                        self.mic_test = None;
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(14.0);
                         ui.label(
                             RichText::new("Kişilerin ses seviyesini değiştirmek için ses kanalında adlarına sağ tıkla.")
                                 .size(12.5)
@@ -1755,6 +1829,26 @@ fn modal_buttons_inner(ui: &mut Ui, ok_text: &str, ok_enabled: bool, danger: boo
         };
     });
     (cancel, ok)
+}
+
+/// Trafik göstergesinin açıklaması: pencere kaydığı için tek bir sıfırlanma
+/// tarihi yok; her gece en eski günün trafiği hesaptan düşer.
+fn usage_tooltip(u: &Usage) -> String {
+    let days = u.window_days.unwrap_or(31);
+    let mut text = format!(
+        "Son {days} gündeki tahmini ses/görüntü trafiği.\n\
+         Tek bir sıfırlanma tarihi yok: her gece en eski günün trafiği hesaptan düşer."
+    );
+    if let (Some(gb), Some(at)) = (u.next_drop_gb, u.next_drop_at) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(t) = chrono::DateTime::from_timestamp_millis(at).filter(|_| at > now) {
+            let local = t.with_timezone(&chrono::Local);
+            let day = if local.date_naive() == chrono::Local::now().date_naive() { "Bugün" } else { "Yarın" };
+            text += &format!("\n\n{day} {}: {gb:.1} GB düşecek", local.format("%H:%M"));
+        }
+    }
+    text += &format!("\nSınır: {:.0} GB (Cloudflare'in aylık 1000 GB ücretsiz kotasından pay bırakılarak)", u.limit_gb);
+    text
 }
 
 fn truncate(s: &str, max: usize) -> String {

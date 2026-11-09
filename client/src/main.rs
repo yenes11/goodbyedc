@@ -8,6 +8,8 @@ mod backend;
 mod config;
 mod ducking;
 mod meter;
+mod mictest;
+mod normalize;
 mod screen;
 mod sfu;
 mod theme;

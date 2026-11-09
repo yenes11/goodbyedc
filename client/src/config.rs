@@ -37,6 +37,9 @@ pub struct Settings {
     /// Kullanıcı id'si -> ses yüksekliği (0..2, 1 = %100).
     #[serde(default)]
     pub user_volumes: HashMap<String, f32>,
+    /// Paylaşılan uygulama sesi herkese aynı yükseklikte gitsin (normalleştirme).
+    #[serde(default = "yes")]
+    pub music_normalize: bool,
 }
 
 impl Default for Settings {
@@ -50,6 +53,7 @@ impl Default for Settings {
             input_auto: true,
             input_threshold_db: default_threshold(),
             user_volumes: HashMap::new(),
+            music_normalize: true,
         }
     }
 }

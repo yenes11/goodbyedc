@@ -41,8 +41,9 @@ pub fn list() -> Vec<AppAudio> {
     Vec::new()
 }
 
-/// `pid` sürecinin sesini yakalar; 48 kHz stereo 16 bit örnekleri `on_data`'ya verir.
-pub fn capture(pid: u32, on_data: impl FnMut(&[i16]) + Send + 'static) -> anyhow::Result<Capture> {
+/// `pid` sürecinin sesini yakalar; 48 kHz stereo 32 bit float örnekleri (-1..1) `on_data`'ya verir.
+/// Float yakalanır ki kısık ses sonradan yükseltildiğinde çözünürlük kaybolmasın.
+pub fn capture(pid: u32, on_data: impl FnMut(&[f32]) + Send + 'static) -> anyhow::Result<Capture> {
     let stop = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
     {
@@ -149,7 +150,7 @@ mod imp {
     pub fn start(
         pid: u32,
         stop: Arc<AtomicBool>,
-        mut on_data: impl FnMut(&[i16]) + Send + 'static,
+        mut on_data: impl FnMut(&[f32]) + Send + 'static,
     ) -> anyhow::Result<()> {
         let (ready_tx, ready_rx) = mpsc::channel::<anyhow::Result<()>>();
         std::thread::Builder::new().name("uygulama-sesi".into()).spawn(move || unsafe {
@@ -178,9 +179,9 @@ mod imp {
                     }
                     let len = frames as usize * channels;
                     if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
-                        on_data(&vec![0i16; len]);
+                        on_data(&vec![0f32; len]);
                     } else {
-                        on_data(std::slice::from_raw_parts(data as *const i16, len));
+                        on_data(std::slice::from_raw_parts(data as *const f32, len));
                     }
                     let _ = capture.ReleaseBuffer(frames);
                 }
@@ -226,13 +227,15 @@ mod imp {
         hr.ok().context("ses yakalama reddedildi")?;
         let client: IAudioClient = unk.ok_or_else(|| anyhow!("ses istemcisi yok"))?.cast()?;
 
+        // WAVE_FORMAT_IEEE_FLOAT (Win32_Media_Multimedia özelliği gerekmesin diye burada).
+        const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
         let format = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_PCM as u16,
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
             nChannels: CHANNELS as u16,
             nSamplesPerSec: SAMPLE_RATE,
-            nAvgBytesPerSec: SAMPLE_RATE * CHANNELS * 2,
-            nBlockAlign: (CHANNELS * 2) as u16,
-            wBitsPerSample: 16,
+            nAvgBytesPerSec: SAMPLE_RATE * CHANNELS * 4,
+            nBlockAlign: (CHANNELS * 4) as u16,
+            wBitsPerSample: 32,
             cbSize: 0,
         };
         client.Initialize(
