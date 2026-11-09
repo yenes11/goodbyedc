@@ -35,6 +35,9 @@ jobs:
 
       - name: Derle
         shell: bash
+        env:
+          # Uygulamada gösterilen sürüm numarası ("Sürüm N")
+          GOODBYEDC_BUILD: ${{ github.run_number }}
         run: cargo build --release
 
       - name: Dosyaları hazırla

@@ -1,7 +1,7 @@
 //! Küçük, tekrar kullanılan arayüz parçaları.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Key, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, ViewportCommand,
+    self, Align2, Color32, CornerRadius, Key, Rect, Response, Sense, Stroke, Ui, Vec2, ViewportCommand,
 };
 use egui_phosphor::regular as ph;
 
@@ -22,18 +22,20 @@ pub enum Tone {
 pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, tone: Tone) -> Response {
     let size = Vec2::splat(32.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let s = press_scale(ui, &resp);
+    let rect = scaled(rect, s);
     let hovered = resp.hovered();
     let (bg, fg) = match tone {
         Tone::Danger if hovered => (RED, Color32::WHITE),
-        Tone::On => (GREEN.gamma_multiply(0.18), GREEN),
+        Tone::On => (GREEN.gamma_multiply(0.15), GREEN),
         Tone::Off => (if hovered { HOVER } else { Color32::TRANSPARENT }, RED),
         _ if hovered => (HOVER, TEXT_STRONG),
         Tone::Danger => (Color32::TRANSPARENT, TEXT),
         _ => (Color32::TRANSPARENT, MUTED),
     };
     let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(8), bg);
-    p.text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(18.0), fg);
+    p.rect_filled(rect, CornerRadius::same(16), bg);
+    p.text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(17.0 * s), fg);
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -42,32 +44,70 @@ pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, tone: Tone) -> Respon
 
 /// Küçük ikon düğmesi (kategori "+" ve kanal silme gibi).
 pub fn small_icon_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    let rect = scaled(rect, press_scale(ui, &resp));
     let fg = if resp.hovered() { TEXT_STRONG } else { MUTED };
+    if resp.hovered() {
+        ui.painter().circle_filled(rect.center(), rect.width() / 2.0, HOVER);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(14.0), fg);
     resp.on_hover_text(tooltip)
 }
 
-/// Mavi ana düğme. `loading` iken yanında dönen gösterge çıkar ve tıklanamaz.
+/// Mavi ana düğme (HeroUI "solid" primary): tam yuvarlak, basınca hafif küçülür.
+/// `loading` iken yanında dönen gösterge çıkar ve tıklanamaz.
 pub fn accent_button(ui: &mut Ui, text: &str, width: f32, enabled: bool, loading: bool) -> Response {
-    let height = 36.0;
+    solid_button(ui, text, width, enabled, loading, ACCENT, ACCENT_HOVER)
+}
+
+/// Kırmızı (tehlikeli işlem) düğme.
+pub fn danger_button(ui: &mut Ui, text: &str, width: f32) -> Response {
+    solid_button(ui, text, width, true, false, RED, Color32::from_rgb(0xf5, 0x3d, 0x7f))
+}
+
+pub const BUTTON_H: f32 = 36.0;
+
+fn solid_button(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    enabled: bool,
+    loading: bool,
+    color: Color32,
+    hover: Color32,
+) -> Response {
     let clickable = enabled && !loading;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), if clickable { Sense::click() } else { Sense::hover() });
-    let bg = if !enabled {
-        ACCENT.gamma_multiply(0.45)
-    } else if loading {
-        ACCENT.gamma_multiply(0.8)
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(width, BUTTON_H), if clickable { Sense::click() } else { Sense::hover() });
+    let s = if clickable { press_scale(ui, &resp) } else { 1.0 };
+    let rect = scaled(rect, s);
+    let bg = if !enabled || loading {
+        color.gamma_multiply(0.5)
     } else if resp.hovered() {
-        ACCENT_HOVER
+        hover
     } else {
-        ACCENT
+        color
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
-    label_with_spinner(ui, rect, text, bold_font(14.0), Color32::WHITE, loading);
+    let fg = if !enabled { Color32::from_white_alpha(140) } else { Color32::WHITE };
+    ui.painter().rect_filled(rect, CornerRadius::same((rect.height() / 2.0) as u8), bg);
+    label_with_spinner(ui, rect, text, font(14.0 * s), fg, loading);
     if clickable && resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+/// Basılıyken düğmenin küçülme oranı (HeroUI: basınca %97'ye iner, bırakınca geri döner).
+pub fn press_scale(ui: &Ui, resp: &Response) -> f32 {
+    let down = resp.is_pointer_button_down_on();
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("press"), down, 0.08);
+    1.0 - 0.04 * t
+}
+
+/// Dikdörtgeni merkezinden ölçekler.
+pub fn scaled(rect: Rect, s: f32) -> Rect {
+    Rect::from_center_size(rect.center(), rect.size() * s)
 }
 
 /// Yazıyı alanın ortasına çizer; `loading` ise solunda küçük dönen gösterge olur.
@@ -129,12 +169,17 @@ pub fn paint_loading(ui: &Ui, rect: Rect, text: &str) {
     ui.painter().text(egui::pos2(c.x, c.y + 18.0), Align2::CENTER_CENTER, text, font(13.5), MUTED);
 }
 
-/// Gri ikincil düğme.
+/// İkincil düğme (HeroUI "flat"): gri dolgulu, çerçevesiz.
 pub fn secondary_button(ui: &mut Ui, text: &str, width: f32) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 36.0), Sense::click());
-    let bg = if resp.hovered() { HOVER } else { BG_ELEV };
-    ui.painter().rect(rect, CornerRadius::same(8), bg, Stroke::new(1.0, BORDER), StrokeKind::Inside);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, font(14.0), TEXT_STRONG);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, BUTTON_H), Sense::click());
+    let s = press_scale(ui, &resp);
+    let rect = scaled(rect, s);
+    let bg = if resp.hovered() { ACTIVE } else { HOVER };
+    ui.painter().rect_filled(rect, CornerRadius::same((rect.height() / 2.0) as u8), bg);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, font(14.0 * s), TEXT_STRONG);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     resp
 }
 
@@ -142,8 +187,9 @@ pub fn secondary_button(ui: &mut Ui, text: &str, width: f32) -> Response {
 pub fn pill_button(ui: &mut Ui, text: &str, loading: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), bold_font(13.0), Color32::WHITE);
     let extra = if loading { 20.0 } else { 0.0 };
-    let size = egui::vec2(galley.size().x + 26.0 + extra, 26.0);
+    let size = egui::vec2(galley.size().x + 24.0 + extra, 28.0);
     let (rect, resp) = ui.allocate_exact_size(size, if loading { Sense::hover() } else { Sense::click() });
+    let rect = scaled(rect, press_scale(ui, &resp));
     let bg = if loading {
         ACCENT.gamma_multiply(0.7)
     } else if resp.hovered() {
@@ -151,7 +197,7 @@ pub fn pill_button(ui: &mut Ui, text: &str, loading: bool) -> Response {
     } else {
         ACCENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(13), bg);
+    ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
     label_with_spinner(ui, rect, text, bold_font(13.0), Color32::WHITE, loading);
     resp
 }
@@ -199,13 +245,15 @@ pub fn window_controls(ui: &mut Ui, height: f32) {
     let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
     let order: Vec<_> = if rtl { buttons.into_iter().rev().collect() } else { buttons.into_iter().collect() };
     for (icon, tip, kind) in order {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, height), Sense::click());
+        let (slot, resp) = ui.allocate_exact_size(egui::vec2(40.0, height), Sense::click());
         let (bg, fg) = match (kind, resp.hovered()) {
             (2, true) => (Color32::from_rgb(0xe8, 0x11, 0x23), Color32::WHITE),
             (_, true) => (HOVER, TEXT_STRONG),
             _ => (Color32::TRANSPARENT, MUTED),
         };
-        ui.painter().rect_filled(rect, 0.0, bg);
+        // Diğer düğmelerle tutarlı: hover zemini hap şeklinde.
+        let rect = scaled(Rect::from_center_size(slot.center(), egui::vec2(36.0, 28.0)), press_scale(ui, &resp));
+        ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(15.0), fg);
         let resp = resp.on_hover_text(tip);
         if resp.clicked() {
@@ -256,23 +304,29 @@ pub fn enter_pressed(ui: &Ui, resp: &Response) -> bool {
     resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
 }
 
-/// Küçük, kalın, büyük harfli başlık ("METİN KANALLARI").
+/// Kenar çubuğundaki grup başlığı (shadcn SidebarGroupLabel: küçük, soluk).
 pub fn section_label(ui: &mut Ui, text: &str) {
-    ui.label(egui::RichText::new(text.replace('i', "İ").to_uppercase()).font(bold_font(11.5)).color(MUTED));
+    ui.label(egui::RichText::new(text).font(bold_font(12.0)).color(MUTED));
+}
+
+/// Form alanı etiketi (shadcn Label: text-sm font-medium).
+pub fn field_label(ui: &mut Ui, text: &str) {
+    ui.label(egui::RichText::new(text).font(bold_font(13.5)).color(TEXT_STRONG));
 }
 
 /// Açma/kapama anahtarı.
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
-    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(38.0, 22.0), Sense::click());
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(46.0, 28.0), Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
     let t = ui.ctx().animate_bool(resp.id, *on);
     let bg = if *on { ACCENT } else { ACTIVE };
-    ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
-    let x = egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t);
-    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, Color32::WHITE);
+    ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
+    let x = egui::lerp(rect.left() + 14.0..=rect.right() - 14.0, t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y + 1.0), 10.0, Color32::from_black_alpha(60));
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 10.0, Color32::WHITE);
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -320,4 +374,36 @@ pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, edita
     p.rect_filled(handle, CornerRadius::same(3), hc);
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
     resp
+}
+
+/// HeroUI modal başlığı: solda daire içinde ikon, sağ üstte kapatma düğmesi,
+/// altında büyük başlık ve soluk açıklama. Kapatma düğmesine basıldıysa `true`.
+pub fn modal_header(ui: &mut Ui, icon: &str, title: &str, desc: &str, danger: bool) -> bool {
+    let mut close = false;
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(egui::vec2(w, 52.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
+        let (bg, fg) = if danger { (RED.gamma_multiply(0.18), RED) } else { (HOVER, TEXT_STRONG) };
+        ui.painter().circle_filled(rect.center(), 26.0, bg);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(24.0), fg);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+            let s = press_scale(ui, &resp);
+            let bg = if resp.hovered() { ACTIVE } else { HOVER };
+            ui.painter().circle_filled(rect.center(), 17.0 * s, bg);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, ph::X, icon_font(16.0 * s), MUTED);
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            close = resp.on_hover_text("Kapat").clicked();
+        });
+    });
+    ui.add_space(18.0);
+    ui.label(egui::RichText::new(title).font(bold_font(21.0)).color(TEXT_STRONG));
+    if !desc.is_empty() {
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(egui::RichText::new(desc).size(14.5).color(MUTED)).wrap());
+    }
+    ui.add_space(18.0);
+    close
 }

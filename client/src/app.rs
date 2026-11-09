@@ -82,6 +82,8 @@ pub struct App {
     messages: HashMap<i64, ChannelMsgs>,
     /// Eski mesajlar başa eklenince kaydırma konumunu korumak için önceki içerik yüksekliği.
     scroll_fix: Option<f32>,
+    /// Bu kadar kare boyunca sohbeti en alta kaydır (kanal açılınca / ilk yüklemede).
+    scroll_bottom: u8,
     last_content_h: f32,
     composer: String,
 
@@ -153,6 +155,7 @@ impl App {
             channel_id: None,
             messages: HashMap::new(),
             scroll_fix: None,
+            scroll_bottom: 0,
             last_content_h: 0.0,
             composer: String::new(),
             my_voice: None,
@@ -211,6 +214,36 @@ impl App {
                 });
             }
             "toast" => self.toast("Ses kanalına bağlanılıyor…", false),
+            d if d.starts_with("channel:") => {
+                let name = &d["channel:".len()..];
+                if let Some(id) = self.channels.iter().find(|c| c.name == name).map(|c| c.id) {
+                    if self.channel_id != Some(id) {
+                        self.select_channel(id);
+                    }
+                }
+            }
+            "fill" => {
+                // Kaydırma testi için kanala sahte mesajlar ekle.
+                if let Some(ch) = self.channel_id {
+                    let c = self.messages.entry(ch).or_default();
+                    if !c.loading && c.list.len() < 50 {
+                        let base = 1_700_000_000_000i64;
+                        for i in 0..60i64 {
+                            let (uid, name) = if (i / 4) % 2 == 0 { (1, "Venovis") } else { (2, "jadaya2") };
+                            c.list.push(Message {
+                                id: 10_000 + i,
+                                channel_id: ch,
+                                user_id: uid,
+                                username: name.into(),
+                                content: format!("deneme mesajı {i}"),
+                                created_at: base + i * 1000,
+                            });
+                        }
+                        c.more = false;
+                        self.scroll_bottom = 3;
+                    }
+                }
+            }
             "music" => {
                 let a = |pid, name: &str| AppAudio { pid, name: name.into() };
                 self.modal = Some(Modal::AudioShare {
@@ -218,10 +251,7 @@ impl App {
                     selected: Some(2),
                 });
             }
-            "settings" => {
-                self.settings.input_auto = false;
-                self.modal = Some(Modal::Settings);
-            }
+            "settings" => self.modal = Some(Modal::Settings),
             _ => {}
         }
     }
@@ -405,6 +435,8 @@ impl App {
                 c.loading = false;
                 if older && Some(channel_id) == self.channel_id {
                     self.scroll_fix = Some(self.last_content_h);
+                } else if Some(channel_id) == self.channel_id {
+                    self.scroll_bottom = 3;
                 }
             }
             ServerMsg::ServerCreated { server } => self.servers.push(server),
@@ -470,6 +502,7 @@ impl App {
 
     fn select_channel(&mut self, id: i64) {
         self.channel_id = Some(id);
+        self.scroll_bottom = 3;
         if let Some(sid) = self.server_id {
             self.settings.last_channel.insert(sid.to_string(), id);
             self.settings.save();
@@ -660,7 +693,7 @@ impl App {
             if !IS_MAC {
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
-                        egui::pos2(full.right() - 138.0, full.top()),
+                        egui::pos2(full.right() - 126.0, full.top()),
                         egui::pos2(full.right(), full.top() + BAR),
                     )),
                     |ui| {
@@ -677,34 +710,34 @@ impl App {
             let card = egui::Rect::from_center_size(full.center(), egui::vec2(card_w, card_h));
             ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
                 Frame::new()
-                    .fill(BG_SIDEBAR)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .corner_radius(16)
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
+                    .corner_radius(28)
                     .inner_margin(Margin::same(28))
-                    .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(100) })
+                    .shadow(egui::Shadow { offset: [0, 12], blur: 36, spread: 0, color: Color32::from_black_alpha(160) })
                     .show(ui, |ui| {
                         ui.set_width(card_w - 56.0);
                         ui.vertical_centered(|ui| {
                             ui.add(egui::Image::new(&self.logo).fit_to_exact_size(Vec2::splat(56.0)));
                             ui.add_space(6.0);
-                            ui.label(RichText::new("goodbyedc").font(bold_font(22.0)).color(TEXT_STRONG));
+                            ui.label(RichText::new("goodbyedc").font(bold_font(24.0)).color(TEXT_STRONG));
                             let sub = if self.auth.registering { "Hesap oluştur" } else { "Tekrar hoş geldin!" };
                             ui.label(RichText::new(sub).color(MUTED));
                         });
                         ui.add_space(14.0);
 
                         let mut submit = false;
-                        widgets::section_label(ui, "Kullanıcı adı");
-                        let r = ui.add(TextEdit::singleline(&mut self.auth.username).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8)));
+                        widgets::field_label(ui, "Kullanıcı adı");
+                        let r = ui.add(TextEdit::singleline(&mut self.auth.username).desired_width(f32::INFINITY).margin(Margin::symmetric(16, 9)));
                         submit |= widgets::enter_pressed(ui, &r);
                         ui.add_space(4.0);
-                        widgets::section_label(ui, "Şifre");
-                        let r = ui.add(TextEdit::singleline(&mut self.auth.password).password(true).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8)));
+                        widgets::field_label(ui, "Şifre");
+                        let r = ui.add(TextEdit::singleline(&mut self.auth.password).password(true).desired_width(f32::INFINITY).margin(Margin::symmetric(16, 9)));
                         submit |= widgets::enter_pressed(ui, &r);
                         if self.auth.registering {
                             ui.add_space(4.0);
-                            widgets::section_label(ui, "Davet kodu");
-                            let r = ui.add(TextEdit::singleline(&mut self.auth.invite).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8)));
+                            widgets::field_label(ui, "Davet kodu");
+                            let r = ui.add(TextEdit::singleline(&mut self.auth.invite).desired_width(f32::INFINITY).margin(Margin::symmetric(16, 9)));
                             submit |= widgets::enter_pressed(ui, &r);
                         }
                         ui.add_space(4.0);
@@ -774,6 +807,9 @@ impl App {
         ui.painter().vline(r.left() + SIDEBAR_W, r.y_range(), Stroke::new(1.0, BORDER));
 
         egui::CentralPanel::default().frame(Frame::new().fill(BG_MAIN)).show(ui, |ui| {
+            // Üst çubuk, sohbet ve mesaj kutusu arasında boşluk olmasın: mesajlar kaydırılırken
+            // kenarlara kadar gitsin. Gereken boşluk kaydırılan içeriğin içinde (padding).
+            ui.spacing_mut().item_spacing.y = 0.0;
             self.header(ui);
             let watching = self.watching.clone().and_then(|w| self.voice.iter().find(|v| v.session_id == w).cloned());
             if let Some(user) = watching {
@@ -800,29 +836,42 @@ impl App {
         ui.add_space(BAR);
 
         // Alt kısımlar önce yerleşir, kanal listesi kalan alanı kullanır.
-        egui::Panel::bottom("user-panel")
+        // Bölümlerin üst çizgileri kenar çubuğunun tüm genişliği boyunca çizilir.
+        let line = |ui: &Ui, r: egui::Rect| {
+            ui.painter().hline(r.x_range(), r.top() + 0.5, Stroke::new(1.0, BORDER));
+        };
+        let r = egui::Panel::bottom("user-panel")
             .show_separator_line(false)
-            .frame(Frame::new().fill(BG_SIDEBAR).inner_margin(Margin::symmetric(8, 8)))
+            .frame(Frame::new().fill(BG_SIDEBAR).inner_margin(Margin { left: 10, right: 8, top: 10, bottom: 10 }))
             .show(ui, |ui| self.user_panel(ui));
+        line(ui, r.response.rect);
         if self.my_voice.is_some() {
-            egui::Panel::bottom("voice-panel")
+            let r = egui::Panel::bottom("voice-panel")
                 .show_separator_line(false)
-                .frame(Frame::new().fill(BG_SIDEBAR).inner_margin(Margin::symmetric(10, 8)))
+                .frame(Frame::new().fill(BG_SIDEBAR).inner_margin(Margin { left: 12, right: 8, top: 10, bottom: 10 }))
                 .show(ui, |ui| self.voice_panel(ui));
+            line(ui, r.response.rect);
         }
-        if let Some(u) = self.usage {
-            egui::Panel::bottom("usage")
-                .show_separator_line(false)
-                .frame(Frame::new().fill(BG_SIDEBAR).inner_margin(Margin { left: 12, right: 12, top: 4, bottom: 6 }))
-                .show(ui, |ui| {
-                    let warn = u.used_gb >= u.limit_gb * 0.8;
-                    ui.label(
-                        RichText::new(format!("Ses/görüntü trafiği (31 gün): {:.1} / {:.0} GB", u.used_gb, u.limit_gb))
-                            .size(11.0)
-                            .color(if warn { RED } else { MUTED }),
-                    );
+        let usage = self.usage;
+        egui::Panel::bottom("usage")
+            .show_separator_line(false)
+            .frame(Frame::new().fill(BG_SIDEBAR).inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 8 }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(u) = usage {
+                        let warn = u.used_gb >= u.limit_gb * 0.8;
+                        ui.label(
+                            RichText::new(format!("Trafik {:.1} / {:.0} GB", u.used_gb, u.limit_gb))
+                                .size(11.5)
+                                .color(if warn { RED } else { MUTED }),
+                        )
+                        .on_hover_text("Son 31 gündeki ses/görüntü trafiği (Cloudflare ücretsiz kotası)");
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(crate::update::version_label()).size(11.5).color(MUTED));
+                    });
                 });
-        }
+            });
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.add_space(8.0);
@@ -891,7 +940,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(RichText::new(&u.username).font(bold_font(13.5)).color(TEXT_STRONG));
                 ui.add_space(6.0);
-                widgets::section_label(ui, "Kullanıcı ses seviyesi");
+                widgets::field_label(ui, "Kullanıcı ses seviyesi");
                 let mut v = self.settings.user_volumes.get(&key).copied().unwrap_or(1.0) * 100.0;
                 let r = ui.add(egui::Slider::new(&mut v, 0.0..=200.0).step_by(1.0).suffix("%").trailing_fill(true));
                 if r.changed() {
@@ -906,7 +955,7 @@ impl App {
                 }
                 if u.tracks.iter().any(|t| t == "music") {
                     ui.add_space(8.0);
-                    widgets::section_label(ui, "Paylaşılan ses (müzik)");
+                    widgets::field_label(ui, "Paylaşılan ses (müzik)");
                     let mkey = format!("music:{}", u.user_id);
                     let mut mv = self.settings.user_volumes.get(&mkey).copied().unwrap_or(1.0) * 100.0;
                     let r = ui.add(egui::Slider::new(&mut mv, 0.0..=200.0).step_by(1.0).suffix("%").trailing_fill(true));
@@ -1007,7 +1056,6 @@ impl App {
         let sharing = v.tracks.iter().any(|t| t == "screen");
         let music = v.tracks.iter().any(|t| t == "music");
         let ch_name = self.channel(v.channel_id).map(|c| c.name.clone()).unwrap_or_default();
-        ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top() - 8.0, Stroke::new(1.0, BORDER));
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
@@ -1036,15 +1084,28 @@ impl App {
     }
 
     fn user_panel(&mut self, ui: &mut Ui) {
-        ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top() - 8.0, Stroke::new(1.0, BORDER));
         let name = self.me.as_ref().map(|m| m.username.clone()).unwrap_or_default();
         let my_sid = self.my_voice.as_ref().map(|v| v.session_id.clone()).unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            widgets::avatar(ui, &name, 30.0, self.speaking.contains(&my_sid));
-            ui.label(RichText::new(&name).font(bold_font(14.0)).color(TEXT_STRONG));
+        let status = if self.settings.deafened {
+            ("Sağırlaştırıldı", RED)
+        } else if self.settings.muted {
+            ("Susturuldu", RED)
+        } else if self.my_voice.is_some() {
+            ("Seste", GREEN)
+        } else {
+            ("Çevrimiçi", MUTED)
+        };
+        let w = ui.available_width();
+        ui.allocate_ui_with_layout(egui::vec2(w, 36.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            widgets::avatar(ui, &name, 34.0, self.speaking.contains(&my_sid));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new(truncate(&name, 14)).font(bold_font(14.0)).color(TEXT_STRONG));
+                ui.label(RichText::new(status.0).size(12.0).color(status.1));
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().item_spacing.x = 0.0;
                 if widgets::icon_button(ui, ph::GEAR_SIX, "Ayarlar", Tone::Normal).clicked() {
                     self.modal = Some(Modal::Settings);
                 }
@@ -1131,13 +1192,13 @@ impl App {
         // Mesaj kutusu altta
         egui::Panel::bottom("composer")
             .show_separator_line(false)
-            .frame(Frame::new().fill(BG_MAIN).inner_margin(Margin { left: 16, right: 16, top: 6, bottom: 18 }))
+            .frame(Frame::new().fill(BG_MAIN).inner_margin(Margin { left: 16, right: 16, top: 0, bottom: 18 }))
             .show(ui, |ui| {
                 Frame::new()
                     .fill(BG_ELEV)
                     .stroke(Stroke::new(1.0, Color32::from_rgb(0x33, 0x34, 0x35)))
-                    .corner_radius(12)
-                    .inner_margin(Margin::symmetric(14, 11))
+                    .corner_radius(22)
+                    .inner_margin(Margin::symmetric(18, 12))
                     .show(ui, |ui| {
                         let resp = ui.add(
                             TextEdit::singleline(&mut self.composer)
@@ -1160,16 +1221,20 @@ impl App {
         let me_id = self.me.as_ref().map(|m| m.id);
         let Some(c) = self.messages.get(&ch_id) else { return };
         let (more, loading) = (c.more, c.loading);
-        let out = ScrollArea::vertical()
-            .id_salt(("messages", ch_id))
-            .stick_to_bottom(true)
-            .auto_shrink(false)
-            .show(ui, |ui| {
+        let mut area = ScrollArea::vertical().id_salt(("messages", ch_id)).stick_to_bottom(true).auto_shrink(false);
+        if self.scroll_bottom > 0 {
+            self.scroll_bottom -= 1;
+            // Çok büyük değer verilirse (f32::MAX) egui NaN üretip çöküyor; içerik yüksekliği yeter.
+            area = area.vertical_scroll_offset(self.last_content_h.max(0.0) + 100_000.0);
+            ui.ctx().request_repaint();
+        }
+        let out = area.show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 if c.list.is_empty() && loading {
                     widgets::loading_center(ui, "Mesajlar yükleniyor…");
                     return;
                 }
-                ui.add_space(12.0);
+                ui.add_space(4.0);
                 if loading {
                     ui.vertical_centered(|ui| widgets::spinner(ui, 18.0, MUTED));
                 } else if more && !c.list.is_empty() {
@@ -1190,7 +1255,8 @@ impl App {
                     message_row(ui, m, grouped, Some(m.user_id) == me_id);
                     prev = Some(m);
                 }
-                ui.add_space(8.0);
+                // Alt padding: son mesaj ile mesaj kutusu arası.
+                ui.add_space(16.0);
             });
 
         // Eski mesajlar başa eklendiyse görünen yeri koru.
@@ -1253,35 +1319,40 @@ impl App {
         let Some(modal) = self.modal.take() else { return };
         let mut keep = true;
         let mut next: Option<Modal> = None;
+        // HeroUI Modal: koyu yüzey, çok ince açık kenar, büyük yuvarlaklık (28), geniş iç boşluk.
+        let mut closed = false;
         let frame = Frame::new()
-            .fill(BG_SIDEBAR)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(16)
-            .inner_margin(Margin::same(22))
-            .shadow(egui::Shadow { offset: [0, 16], blur: 48, spread: 0, color: Color32::from_black_alpha(120) });
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
+            .corner_radius(28)
+            .inner_margin(Margin::same(28))
+            .shadow(egui::Shadow { offset: [0, 20], blur: 60, spread: 0, color: Color32::from_black_alpha(190) });
         let resp = egui::Modal::new(Id::new("modal"))
             .backdrop_color(Color32::from_black_alpha(128))
             .frame(frame)
             .show(ctx, |ui| {
-                ui.set_width(420.0);
+                ui.set_width(440.0);
                 match modal {
                     Modal::CreateChannel { kind, mut name } => {
-                        let title = if kind == "voice" { "Ses kanalı oluştur" } else { "Metin kanalı oluştur" };
-                        ui.label(RichText::new(title).font(bold_font(18.0)).color(TEXT_STRONG));
-                        ui.add_space(10.0);
+                        let (icon, title, desc) = if kind == "voice" {
+                            (ph::SPEAKER_HIGH, "Ses kanalı oluştur", "Arkadaşlarınla konuşmak ve ekran paylaşmak için yeni bir ses kanalı.")
+                        } else {
+                            (ph::HASH, "Metin kanalı oluştur", "Mesajlaşmak için yeni bir metin kanalı.")
+                        };
+                        closed |= widgets::modal_header(ui, icon, title, desc, false);
                         let r = ui.add(
                             TextEdit::singleline(&mut name)
                                 .hint_text(if kind == "voice" { "Kanal adı" } else { "kanal-adi" })
                                 .char_limit(50)
                                 .desired_width(f32::INFINITY)
-                                .margin(Margin::symmetric(10, 8)),
+                                .margin(Margin::symmetric(16, 9)),
                         );
                         if self.modal_focus {
                             r.request_focus();
                             self.modal_focus = false;
                         }
                         let mut create = widgets::enter_pressed(ui, &r);
-                        ui.add_space(14.0);
+                        ui.add_space(22.0);
                         let (cancel, ok) = modal_buttons(ui, "Oluştur", !name.trim().is_empty());
                         create |= ok;
                         if cancel {
@@ -1294,11 +1365,10 @@ impl App {
                         }
                     }
                     Modal::DeleteChannel { id, name } => {
-                        ui.label(RichText::new("Kanalı sil").font(bold_font(18.0)).color(TEXT_STRONG));
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(format!("“{name}” kanalı ve tüm mesajları silinecek. Emin misin?")).color(TEXT));
-                        ui.add_space(14.0);
-                        let (cancel, ok) = modal_buttons(ui, "Sil", true);
+                        let desc = format!("“{name}” kanalı ve tüm mesajları kalıcı olarak silinecek. Emin misin?");
+                        closed |= widgets::modal_header(ui, ph::TRASH, "Kanalı sil", &desc, true);
+                        ui.add_space(4.0);
+                        let (cancel, ok) = modal_buttons_danger(ui, "Sil");
                         if cancel {
                             keep = false;
                         } else if ok {
@@ -1309,14 +1379,13 @@ impl App {
                         }
                     }
                     Modal::AudioShare { apps, mut selected } => {
-                        ui.label(RichText::new("Uygulama sesi paylaş").font(bold_font(18.0)).color(TEXT_STRONG));
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Seçtiğin uygulamanın sesi ses kanalındaki herkese gider. Yalnızca o uygulamanın sesi paylaşılır.")
-                                .size(12.5)
-                                .color(MUTED),
+                        closed |= widgets::modal_header(
+                            ui,
+                            ph::MUSIC_NOTES,
+                            "Uygulama sesi paylaş",
+                            "Seçtiğin uygulamanın sesi ses kanalındaki herkese gider. Yalnızca o uygulamanın sesi paylaşılır.",
+                            false,
                         );
-                        ui.add_space(10.0);
                         let mut share_now = false;
                         ScrollArea::vertical().max_height(260.0).min_scrolled_height(260.0).auto_shrink([false, false]).show(ui, |ui| {
                             match &apps {
@@ -1331,10 +1400,10 @@ impl App {
                                 Some(list) => {
                                     for a in list {
                                         let is_sel = selected == Some(a.pid);
-                                        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), Sense::click());
-                                        let bg = if is_sel { BG_ELEV } else if r.hovered() { HOVER } else { BG_MAIN };
-                                        let stroke = if is_sel { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, BG_MAIN) };
-                                        ui.painter().rect(rect.shrink(1.0), CornerRadius::same(8), bg, stroke, StrokeKind::Inside);
+                                        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
+                                        let bg = if is_sel { ACCENT.gamma_multiply(0.12) } else if r.hovered() { ACTIVE } else { HOVER };
+                                        let stroke = if is_sel { Stroke::new(2.0, ACCENT) } else { Stroke::NONE };
+                                        ui.painter().rect(rect.shrink(1.0), CornerRadius::same(19), bg, stroke, StrokeKind::Inside);
                                         ui.painter().text(egui::pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, ph::MUSIC_NOTES, icon_font(17.0), MUTED);
                                         ui.painter().text(egui::pos2(rect.left() + 40.0, rect.center().y), Align2::LEFT_CENTER, truncate(&a.name, 52), font(13.5), TEXT_STRONG);
                                         if r.clicked() {
@@ -1369,11 +1438,8 @@ impl App {
                         }
                     }
                     Modal::Settings => {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Ses ayarları").font(bold_font(18.0)).color(TEXT_STRONG));
-                        });
-                        ui.add_space(14.0);
-                        widgets::section_label(ui, "Giriş hassasiyeti");
+                        closed |= widgets::modal_header(ui, ph::GEAR_SIX, "Ses ayarları", "Mikrofon hassasiyeti ve kişilere özel ses seviyeleri.", false);
+                        widgets::field_label(ui, "Giriş hassasiyeti");
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Otomatik belirle").color(TEXT));
@@ -1413,30 +1479,31 @@ impl App {
                                 .size(12.5)
                                 .color(MUTED),
                         );
-                        ui.add_space(16.0);
-                        ui.horizontal(|ui| {
+                        ui.add_space(24.0);
+                        let w = ui.available_width();
+                        if widgets::accent_button(ui, "Tamam", w, true, false).clicked() {
+                            keep = false;
+                        }
+                        ui.add_space(10.0);
+                        ui.vertical_centered(|ui| {
                             if ui.link(RichText::new("Çıkış yap").color(RED).size(13.5)).clicked() {
                                 keep = false;
                                 self.logout();
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if widgets::accent_button(ui, "Tamam", 100.0, true, false).clicked() {
-                                    keep = false;
-                                }
-                            });
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(format!("goodbyedc · {}", crate::update::version_label())).size(12.0).color(MUTED));
                         });
                         if keep {
                             next = Some(Modal::Settings);
                         }
                     }
                     Modal::ScreenShare { sources, mut tab, mut selected } => {
-                        ui.label(RichText::new("Ekran paylaş").font(bold_font(18.0)).color(TEXT_STRONG));
-                        ui.add_space(10.0);
+                        closed |= widgets::modal_header(ui, ph::SCREENCAST, "Ekran paylaş", "Ses kanalındakilerin izleyeceği ekranı veya pencereyi seç.", false);
                         // Sekmeler
+                        // HeroUI Tabs (solid): gri zemin, seçili sekme daha açık bir "imleç".
                         Frame::new()
                             .fill(BG_INPUT)
-                            .stroke(Stroke::new(1.0, BORDER))
-                            .corner_radius(10)
+                            .corner_radius(20)
                             .inner_margin(Margin::same(4))
                             .show(ui, |ui| {
                                 ui.columns(2, |cols| {
@@ -1450,8 +1517,8 @@ impl App {
                                         let ui = &mut cols[i];
                                         let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
                                         let active = tab == t;
-                                        let bg = if active { ACTIVE } else if r.hovered() { HOVER } else { Color32::TRANSPARENT };
-                                        ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
+                                        let bg = if active { ACTIVE } else { Color32::TRANSPARENT };
+                                        ui.painter().rect_filled(rect, CornerRadius::same(16), bg);
                                         let fg = if active { TEXT_STRONG } else { MUTED };
                                         let text = ui.painter().layout_no_wrap(label.to_string(), font(13.5), fg);
                                         let total = 16.0 + 8.0 + text.size().x;
@@ -1486,10 +1553,10 @@ impl App {
                                     for s in items {
                                         let id = s.id.to_string();
                                         let is_sel = selected.as_deref() == Some(id.as_str());
-                                        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), Sense::click());
-                                        let bg = if is_sel { BG_ELEV } else if r.hovered() { HOVER } else { BG_MAIN };
-                                        let stroke = if is_sel { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, BG_MAIN) };
-                                        ui.painter().rect(rect.shrink(1.0), CornerRadius::same(8), bg, stroke, StrokeKind::Inside);
+                                        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
+                                        let bg = if is_sel { ACCENT.gamma_multiply(0.12) } else if r.hovered() { ACTIVE } else { HOVER };
+                                        let stroke = if is_sel { Stroke::new(2.0, ACCENT) } else { Stroke::NONE };
+                                        ui.painter().rect(rect.shrink(1.0), CornerRadius::same(19), bg, stroke, StrokeKind::Inside);
                                         let icon = if want == "screen" { ph::MONITOR } else { ph::APP_WINDOW };
                                         ui.painter().text(egui::pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, icon, icon_font(17.0), MUTED);
                                         let title = truncate(&s.title, 52);
@@ -1524,7 +1591,7 @@ impl App {
                     }
                 }
             });
-        if resp.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if closed || resp.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
             keep = false;
         }
         if keep {
@@ -1545,15 +1612,20 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
+                // HeroUI Toast tarzı bildirim
                 Frame::new()
-                    .fill(BG_ELEV)
-                    .stroke(Stroke::new(1.0, if error { RED } else { BORDER }))
-                    .corner_radius(10)
-                    .inner_margin(Margin::symmetric(16, 10))
-                    .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(110) })
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
+                    .corner_radius(20)
+                    .inner_margin(Margin::symmetric(18, 12))
+                    .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(140) })
                     .show(ui, |ui| {
                         ui.set_max_width(520.0);
-                        ui.label(RichText::new(text).color(TEXT_STRONG));
+                        ui.horizontal(|ui| {
+                            let (icon, c) = if error { (ph::WARNING_CIRCLE, RED) } else { (ph::INFO, MUTED) };
+                            ui.label(RichText::new(icon).font(icon_font(16.0)).color(c));
+                            ui.label(RichText::new(text).font(bold_font(13.5)).color(TEXT_STRONG));
+                        });
                     });
             });
     }
@@ -1592,8 +1664,9 @@ impl App {
 fn channel_row(ui: &mut Ui, icon: &str, name: &str, active: bool, loading: bool) -> (bool, bool) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     let hovered = resp.hovered() || ui.rect_contains_pointer(rect);
+    // HeroUI: seçili öğe ana rengin hafif tonu ve ana renkli yazı ("flat primary").
     let bg = if active { ACTIVE } else if hovered { HOVER } else { Color32::TRANSPARENT };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    ui.painter().rect_filled(rect, CornerRadius::same(16), bg);
     let fg = if active || hovered { TEXT_STRONG } else { MUTED };
     ui.painter().text(egui::pos2(rect.left() + 18.0, rect.center().y), Align2::CENTER_CENTER, icon, icon_font(17.0), MUTED);
     ui.painter().text(egui::pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, truncate(name, 24), font(14.0), fg);
@@ -1643,7 +1716,7 @@ fn message_row(ui: &mut Ui, m: &Message, grouped: bool, _mine: bool) {
             ui.add(egui::Label::new(RichText::new(&m.content).size(14.5).color(TEXT)).wrap().selectable(true));
         },
     );
-    let h = inner.response.rect.height().max(if grouped { 20.0 } else { avatar });
+    let h = inner.response.rect.height().max(if grouped { 0.0 } else { avatar });
     let row = egui::Rect::from_min_size(egui::pos2(start.x, start.y - 2.0), egui::vec2(width, h + 4.0));
     if ui.rect_contains_pointer(row) {
         ui.painter().set(bg_idx, egui::Shape::rect_filled(row, 0.0, Color32::from_white_alpha(4)));
@@ -1653,17 +1726,33 @@ fn message_row(ui: &mut Ui, m: &Message, grouped: bool, _mine: bool) {
         widgets::paint_avatar(ui, av, &m.username, false);
     }
     ui.allocate_rect(egui::Rect::from_min_size(start, egui::vec2(width, h)), Sense::hover());
-    ui.add_space(2.0);
+    ui.add_space(3.0);
 }
 
-/// İki düğme: Vazgeç / onay. (vazgeç, onay)
+/// İki düğme yan yana, eşit genişlikte: Vazgeç / onay. (vazgeç, onay)
 fn modal_buttons(ui: &mut Ui, ok_text: &str, ok_enabled: bool) -> (bool, bool) {
+    modal_buttons_inner(ui, ok_text, ok_enabled, false)
+}
+
+/// Tehlikeli işlem için: onay düğmesi kırmızı.
+fn modal_buttons_danger(ui: &mut Ui, ok_text: &str) -> (bool, bool) {
+    modal_buttons_inner(ui, ok_text, true, true)
+}
+
+fn modal_buttons_inner(ui: &mut Ui, ok_text: &str, ok_enabled: bool, danger: bool) -> (bool, bool) {
     let mut cancel = false;
     let mut ok = false;
+    let gap = 10.0;
+    let w = (ui.available_width() - gap) / 2.0;
     // Sabit yükseklikli satır: yoksa düzen tüm boş yüksekliği kaplar ve pencere uzar.
-    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 36.0), Layout::right_to_left(Align::Center), |ui| {
-        ok = widgets::accent_button(ui, ok_text, 100.0, ok_enabled, false).clicked();
-        cancel = widgets::secondary_button(ui, "Vazgeç", 90.0).clicked();
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), widgets::BUTTON_H), Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        cancel = widgets::secondary_button(ui, "Vazgeç", w).clicked();
+        ok = if danger {
+            widgets::danger_button(ui, ok_text, w).clicked()
+        } else {
+            widgets::accent_button(ui, ok_text, w, ok_enabled, false).clicked()
+        };
     });
     (cancel, ok)
 }

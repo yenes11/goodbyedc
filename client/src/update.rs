@@ -48,6 +48,17 @@ fn own_sha256() -> Result<&'static str> {
 /// kendisi verir; elle derlenen sürümlerde boş kalır ve güncelleme kapalı olur.
 const REPO: Option<&str> = option_env!("GITHUB_REPOSITORY");
 
+/// GitHub derlemesinin numarası ("Sürüm N" ile aynı); yerel derlemelerde yok.
+const BUILD: Option<&str> = option_env!("GOODBYEDC_BUILD");
+
+/// Arayüzde gösterilen sürüm: "Sürüm 14" ya da yerel derlemede "Geliştirme 0.2.0".
+pub fn version_label() -> String {
+    match BUILD {
+        Some(n) => format!("Sürüm {n}"),
+        None => format!("Geliştirme {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 /// Sadece GitHub Actions'ta derlenmiş sürümler güncellenir.
 fn enabled() -> bool {
     !cfg!(debug_assertions) && REPO.is_some()

@@ -10,6 +10,8 @@ const fn hex(v: u32) -> Color32 {
     Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
 
+// Renkler: Claude masaüstü uygulamasının koyu teması, vurgu rengi mavi (#2373F4).
+// (Biçim HeroUI tarzında: hap butonlar, büyük yuvarlaklık, çerçevesiz dolgulu yüzeyler.)
 pub const BG_SIDEBAR: Color32 = hex(0x252627);
 pub const BG_MAIN: Color32 = hex(0x191919);
 pub const BG_INPUT: Color32 = hex(0x141414);
@@ -24,6 +26,12 @@ pub const ACCENT: Color32 = hex(0x2373f4);
 pub const ACCENT_HOVER: Color32 = hex(0x1a62d6);
 pub const GREEN: Color32 = hex(0x3fb36b);
 pub const RED: Color32 = hex(0xe5534b);
+/// Modal, kart ve bildirim yüzeyi.
+pub const SURFACE: Color32 = hex(0x252627);
+
+/// Köşe yuvarlaklıkları (HeroUI radius: small 8, medium 12, large 14).
+pub const R_SM: u8 = 12; // düğme, input (medium)
+pub const R_LG: u8 = 14; // modal, kart (large)
 
 /// Kalın yazı için ayrı yazı tipi ailesi.
 pub fn bold() -> FontFamily {
@@ -143,37 +151,42 @@ pub fn setup_style(ctx: &egui::Context) {
         v.dark_mode = true;
         v.override_text_color = None;
         v.panel_fill = BG_MAIN;
-        v.window_fill = BG_SIDEBAR;
-        v.window_stroke = Stroke::new(1.0, BORDER);
-        v.window_corner_radius = CornerRadius::same(14);
-        v.window_shadow = Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(110) };
-        v.popup_shadow = Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) };
+        v.window_fill = SURFACE;
+        v.window_stroke = Stroke::NONE;
+        v.window_corner_radius = CornerRadius::same(R_LG);
+        v.menu_corner_radius = CornerRadius::same(R_SM);
+        v.window_shadow = Shadow { offset: [0, 12], blur: 36, spread: 0, color: Color32::from_black_alpha(160) };
+        v.popup_shadow = Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(150) };
+        v.slider_trailing_fill = true;
+        v.handle_shape = egui::style::HandleShape::Circle;
         v.extreme_bg_color = BG_INPUT;
         v.text_edit_bg_color = Some(BG_INPUT);
         v.faint_bg_color = BG_ELEV;
         v.code_bg_color = BG_ELEV;
         v.hyperlink_color = ACCENT;
-        v.selection.bg_fill = ACCENT.gamma_multiply(0.55);
-        v.selection.stroke = Stroke::new(1.0, ACCENT);
+        v.selection.bg_fill = ACCENT.gamma_multiply(0.45);
+        // Odaklanan input: HeroUI'de çerçeve yok; hafif bir mavi kenar yeterli.
+        v.selection.stroke = Stroke::new(1.5, ACCENT.gamma_multiply(0.7));
         v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
 
-        let r = CornerRadius::same(8);
+        // Inputlar (ve egui'nin kendi çizdiği diğer öğeler) hap şeklinde.
+        let r = CornerRadius::same(20);
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = BG_MAIN;
         w.noninteractive.weak_bg_fill = BG_MAIN;
-        w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER); // ayırıcılar
         w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
         w.noninteractive.corner_radius = r;
 
-        w.inactive.bg_fill = BG_ELEV;
-        w.inactive.weak_bg_fill = BG_ELEV;
-        w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        w.inactive.bg_fill = ACTIVE; // slider rayı vb.
+        w.inactive.weak_bg_fill = Color32::TRANSPARENT; // düğmeler: outline
+        w.inactive.bg_stroke = Stroke::NONE;
         w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
         w.inactive.corner_radius = r;
 
         w.hovered.bg_fill = HOVER;
         w.hovered.weak_bg_fill = HOVER;
-        w.hovered.bg_stroke = Stroke::new(1.0, BORDER);
+        w.hovered.bg_stroke = Stroke::NONE;
         w.hovered.fg_stroke = Stroke::new(1.0, TEXT_STRONG);
         w.hovered.corner_radius = r;
         w.hovered.expansion = 0.0;
