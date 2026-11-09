@@ -591,8 +591,25 @@ export class Hub extends DurableObject<Env> {
     return this.usedBytes() >= this.limitBytes();
   }
 
+  /** Bir sonraki gece yarısında (UTC) 31 günlük pencereden çıkacak günün trafiği. */
+  nextDropBytes(): number {
+    const row = this.sql
+      .exec("SELECT COALESCE(SUM(bytes), 0) AS b FROM usage_daily WHERE day = ?", dayOffset(-(WINDOW_DAYS - 1)))
+      .one();
+    return row.b as number;
+  }
+
   usageInfo() {
-    return { usedGB: +(this.usedBytes() / 1e9).toFixed(2), limitGB: this.limitBytes() / 1e9 };
+    const next = new Date();
+    next.setUTCHours(24, 0, 0, 0);
+    return {
+      usedGB: +(this.usedBytes() / 1e9).toFixed(2),
+      limitGB: this.limitBytes() / 1e9,
+      // Pencere kayıyor: her gece yarısı (UTC) en eski günün trafiği düşer.
+      nextDropGB: +(this.nextDropBytes() / 1e9).toFixed(2),
+      nextDropAt: next.getTime(),
+      windowDays: WINDOW_DAYS,
+    };
   }
 
   broadcast(data: unknown, exclude?: WebSocket) {

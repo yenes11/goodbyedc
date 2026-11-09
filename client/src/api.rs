@@ -69,6 +69,14 @@ pub struct Usage {
     pub used_gb: f64,
     #[serde(rename = "limitGB")]
     pub limit_gb: f64,
+    /// Bir sonraki gece yarısında (UTC) hesaptan düşecek trafik (eski sunucuda yok).
+    #[serde(rename = "nextDropGB", default)]
+    pub next_drop_gb: Option<f64>,
+    /// Düşüşün olacağı an (Unix ms).
+    #[serde(rename = "nextDropAt", default)]
+    pub next_drop_at: Option<i64>,
+    #[serde(rename = "windowDays", default)]
+    pub window_days: Option<u32>,
 }
 
 /// Sunucudan gelen mesajlar ("t" alanına göre).

@@ -103,6 +103,8 @@ const GATE_HOLD: Duration = Duration::from_millis(600);
 pub struct Shared {
     pub deafened: AtomicBool,
     pub muted: AtomicBool,
+    /// Paylaşılan uygulama sesi gönderilmeden önce dengelensin mi?
+    pub music_normalize: AtomicBool,
     pub gate: Mutex<Gate>,
     /// Oturum id'si -> çalma yüksekliği (0..2, 1 = normal).
     pub volumes: Mutex<HashMap<String, f32>>,
@@ -499,7 +501,7 @@ impl Call {
         }
         // Yakalanan ses tampona girer; 10 ms'lik dilimler düzenli olarak gönderilir.
         // Uygulama sustuğunda (duraklatınca) sessizlik gönderilir, böylece yayın kesilmez.
-        let buf = Arc::new(Mutex::new(std::collections::VecDeque::<i16>::new()));
+        let buf = Arc::new(Mutex::new(std::collections::VecDeque::<f32>::new()));
         let capture = {
             let buf = buf.clone();
             crate::appaudio::capture(pid, move |d| {
@@ -521,7 +523,9 @@ impl Call {
         );
         let pacer = {
             let source = source.clone();
+            let shared = self.shared.clone();
             spawn(async move {
+                let mut norm = crate::normalize::Normalizer::default();
                 let chunk = (SAMPLE_RATE / 100 * CHANNELS) as usize;
                 let mut tick = tokio::time::interval(Duration::from_millis(10));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
@@ -529,7 +533,7 @@ impl Call {
                 let mut primed = false;
                 loop {
                     tick.tick().await;
-                    let data: Vec<i16> = {
+                    let mut data: Vec<f32> = {
                         let mut b = buf.lock();
                         if !primed && b.len() >= chunk * 4 {
                             primed = true;
@@ -540,11 +544,15 @@ impl Call {
                             if b.is_empty() {
                                 primed = false;
                             }
-                            vec![0; chunk]
+                            vec![0.0; chunk]
                         }
                     };
+                    if shared.music_normalize.load(Ordering::Relaxed) {
+                        norm.process(&mut data);
+                    }
+                    let pcm: Vec<i16> = data.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
                     let frame = AudioFrame {
-                        data: data.into(),
+                        data: pcm.into(),
                         sample_rate: SAMPLE_RATE,
                         num_channels: CHANNELS,
                         samples_per_channel: SAMPLE_RATE / 100,
