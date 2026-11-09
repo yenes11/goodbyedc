@@ -1,7 +1,16 @@
-//! Arka plan işleri: giriş, WebSocket bağlantısı, ses/ekran ve güncelleme.
+//! Background work: login, the WebSocket connection, voice/screen and updates.
 //!
-//! Arayüz `Cmd` gönderir, arka plan `Event` döner. Arayüz her karede gelen
-//! olayları okur; yeni olay gelince ekran yeniden çizdirilir.
+//! The UI and the background talk through two channels (queues):
+//!   - UI -> background: the UI sends a `Cmd` (command), e.g. "log in", "join voice".
+//!   - background -> UI: the background sends back an `Event`, e.g. "logged in",
+//!     "server message arrived".
+//! The UI reads the waiting events at the start of every frame; whenever an event
+//! is sent we also ask egui to repaint, so the UI reacts immediately.
+//!
+//! The background runs as async *tasks* on the tokio runtime. An async function
+//! (`async fn`) doesn't block a thread while waiting (for the network, a timer...):
+//! at every `.await` the task pauses and tokio runs other tasks meanwhile.
+//! `tokio::spawn(future)` starts a task that runs independently.
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -20,6 +29,8 @@ use crate::sfu::Sfu;
 use crate::update;
 use crate::voice::{Call, Participant, Shared};
 
+/// WebSocket connection state, shown in the UI.
+/// `#[derive(...)]`: Debug (printable), Clone/Copy (cheap copies), PartialEq/Eq (`==`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conn {
     Connecting,
@@ -27,21 +38,29 @@ pub enum Conn {
     Reconnecting,
 }
 
+/// Commands from the UI to the background.
+///
+/// An enum where each variant can carry its own data — like a tagged union. The
+/// receiver uses `match` to find out which command it got and to unpack the data.
 pub enum Cmd {
     Login { username: String, password: String },
     Register { username: String, password: String, invite: String },
-    /// Kayıtlı token ile bağlan.
+    /// Connect the WebSocket with a saved login token.
     Connect { token: String },
     Logout,
-    /// Sunucuya ham WebSocket mesajı.
+    /// A raw JSON message to send to the server over the WebSocket.
     Send(Value),
     Voice(VoiceCmd),
     ScreenSources,
-    /// Ses çalan uygulamaları listele (ses paylaşımı için).
+    /// List apps that are playing audio (for app-audio sharing).
     AudioApps,
+    /// Fetch the preview of a link posted in chat.
+    Preview(String),
     CheckUpdate { manual: bool },
 }
 
+/// Voice-related commands. They are processed one at a time, in order, by a
+/// single task (`voice_loop`), because WebRTC negotiation steps must not overlap.
 pub enum VoiceCmd {
     Join { channel_id: i64, muted: bool, deafened: bool },
     Leave,
@@ -55,10 +74,11 @@ pub enum VoiceCmd {
     ApplyUpdate,
 }
 
+/// Events from the background to the UI.
 pub enum Event {
     LoggedIn { token: String },
     AuthError(String),
-    /// Token geçersiz: giriş ekranına dön.
+    /// The login token is no longer valid: go back to the login screen.
     AuthExpired,
     Conn(Conn),
     Server(ServerMsg),
@@ -68,12 +88,17 @@ pub enum Event {
     Tracks(Vec<String>),
     Sources(Vec<SourceInfo>),
     AudioApps(Vec<crate::appaudio::AppAudio>),
+    Preview { url: String, preview: Option<crate::preview::Preview> },
     Update { check: update::Check, manual: bool },
     UpdateFailed,
     Toast { text: String, error: bool },
 }
 
-/// Olayları arayüze iletir ve ekranı yeniden çizdirir.
+/// Delivers events to the UI and makes the UI repaint.
+///
+/// Each background task gets its own clone of the Sink (`#[derive(Clone)]`).
+/// `mpsc::Sender` = "multi-producer, single-consumer" channel sender: many senders,
+/// one receiver (the UI).
 #[derive(Clone)]
 struct Sink {
     tx: mpsc::Sender<Event>,
@@ -90,6 +115,8 @@ impl Sink {
     }
 }
 
+/// The UI's handle to the background: send commands, receive events.
+/// `pub` fields are readable from other modules (the UI reads `events` and `shared`).
 pub struct Backend {
     tx: UnboundedSender<Cmd>,
     pub events: mpsc::Receiver<Event>,
@@ -97,6 +124,7 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Starts the background worker on the given tokio runtime.
     pub fn start(rt: &tokio::runtime::Runtime, base: String) -> Self {
         crate::voice::set_runtime(rt.handle().clone());
         let shared = Arc::new(Shared::default());
@@ -120,15 +148,20 @@ impl Backend {
     }
 }
 
+/// The main background task: receives commands from the UI and dispatches them.
+/// Long operations are spawned as separate tasks so the loop stays responsive.
 async fn main_loop(base: String, mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
     let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build().unwrap();
     let mut token: Option<String> = None;
     let mut ws: Option<(UnboundedSender<String>, JoinHandle<()>)> = None;
 
-    // Ses işlemleri sırayla çalışsın diye ayrı bir görevde.
+    // Voice operations run in their own task, strictly one after another.
+    // Each voice command is sent there together with the current login token.
     let (voice_tx, voice_rx) = unbounded_channel::<(String, VoiceCmd)>();
     tokio::spawn(voice_loop(base.clone(), voice_rx, sink.clone()));
 
+    // `rx.recv().await` waits for the next command; it returns `None` when the
+    // UI side is gone (app closing), which ends the loop.
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Cmd::Login { username, password } => {
@@ -179,6 +212,20 @@ async fn main_loop(base: String, mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                     sink.send(Event::AudioApps(list));
                 });
             }
+            Cmd::Preview(url) => {
+                let sink = sink.clone();
+                let http = http.clone();
+                tokio::spawn(async move {
+                    let preview = match crate::preview::fetch(&http, &url).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            log::debug!("önizleme yok ({url}): {e:#}");
+                            None
+                        }
+                    };
+                    sink.send(Event::Preview { url, preview });
+                });
+            }
             Cmd::CheckUpdate { manual } => {
                 let sink = sink.clone();
                 tokio::spawn(async move {
@@ -193,6 +240,7 @@ async fn main_loop(base: String, mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
     }
 }
 
+/// Login or register: POST the body to /api/<path>; on success we get a token.
 async fn auth(http: &reqwest::Client, base: &str, path: &str, body: Value, sink: &Sink) {
     let res = async {
         let r = http.post(format!("{base}/api/{path}")).json(&body).send().await?;
@@ -219,7 +267,8 @@ async fn auth(http: &reqwest::Client, base: &str, path: &str, body: Value, sink:
     }
 }
 
-/// WebSocket bağlantısını açık tutar; koparsa artan aralıklarla yeniden bağlanır.
+/// Keeps the WebSocket connection open; if it drops, reconnects with growing
+/// delays (0.5 s, 1 s, 2 s, ... up to 10 s).
 async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<String>, sink: Sink) {
     let url = format!("{}/api/ws?token={}", base.replacen("http", "ws", 1), token);
     let mut retry: u32 = 0;
@@ -229,10 +278,16 @@ async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<Stri
             Ok((stream, _)) => {
                 retry = 0;
                 sink.send(Event::Conn(Conn::Connected));
+                // Split the socket into a writing half and a reading half so both can be used in the loop.
                 let (mut write, mut read) = stream.split();
                 let mut ping = tokio::time::interval(Duration::from_secs(30));
+                // Send "ping" every 30 s so proxies don't close an idle connection.
+                // (The first tick of an interval fires immediately; consume it here.)
                 ping.tick().await;
                 loop {
+                    // `select!` waits on several futures at once and runs the branch of whichever
+                    // finishes first: an incoming message, an outgoing message from the UI, or the
+                    // ping timer.
                     tokio::select! {
                         msg = read.next() => match msg {
                             Some(Ok(WsMessage::Text(t))) => {
@@ -261,6 +316,7 @@ async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<Stri
                     }
                 }
             }
+            // HTTP 401 = our token was rejected: log out instead of retrying forever.
             Err(tungstenite::Error::Http(resp)) if resp.status() == 401 => {
                 sink.send(Event::AuthExpired);
                 return;
@@ -269,17 +325,20 @@ async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<Stri
         }
         retry += 1;
         sink.send(Event::Conn(Conn::Reconnecting));
+        // Exponential backoff: 500 ms << n = 500 · 2^n ms, capped at 10 s.
         let delay = (500u64 << retry.min(5)).min(10_000);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
 }
 
-/// Ses kanalı işlemleri: hepsi sırayla, tek görevde.
+/// Voice channel operations: all processed in order, in a single task.
+/// Every 3 seconds it also runs maintenance: reconnect if the WebRTC connection
+/// broke, otherwise `heal()` (retry failed pulls, replace stalled audio).
 async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>, sink: Sink) {
     let factory = PeerConnectionFactory::default();
     let shared = sink.shared.clone();
     let mut call: Option<Call> = None;
-    // Bağlantı koparsa aynı kanala yeniden katılmak için.
+    // Remembered so we can rejoin the same channel if the connection breaks.
     let mut current: Option<(i64, String)> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -409,7 +468,7 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
     }
 }
 
-/// Yeni sürümü başlatıp bu süreci kapatır.
+/// Starts the new version of the app and exits this process.
 fn restart() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe).spawn();

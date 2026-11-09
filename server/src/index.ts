@@ -3,12 +3,25 @@ import { DurableObject } from "cloudflare:workers";
 // ---------------------------------------------------------------------------
 // goodbyedc backend
 //
-// Tek bir Durable Object ("Hub") tüm uygulamayı yönetir: kullanıcılar,
-// sunucular, kanallar, mesajlar (SQLite) ve WebSocket bağlantıları.
-// Ses/ekran paylaşımı Cloudflare Realtime SFU üzerinden geçer; bu Worker
-// sadece SFU API'sine giden istekleri doğrulayıp (token ekleyerek) iletir.
+// A single Durable Object ("Hub") runs the whole app: users, servers,
+// channels, messages (stored in its built-in SQLite database) and all
+// WebSocket connections.
+//
+// Cloudflare terms:
+//   - Worker: a small serverless function that handles HTTP requests at
+//     Cloudflare's edge. The `default export` below is our Worker.
+//   - Durable Object (DO): a single stateful instance with its own storage.
+//     Because there's exactly one "main" Hub, every client talks to the same
+//     instance, which makes broadcasting chat/voice updates simple.
+//   - WebSocket hibernation: the DO can sleep while sockets stay open; it's woken
+//     up when a message arrives. Per-socket data survives in "attachments".
+//
+// Voice/screen sharing goes through Cloudflare Realtime SFU; this Worker only
+// checks the client's requests to the SFU API and forwards them (adding the
+// secret app token).
 // ---------------------------------------------------------------------------
 
+/** Bindings and secrets configured in wrangler.jsonc / `wrangler secret put`. */
 export interface Env {
   HUB: DurableObjectNamespace<Hub>;
   INVITE_CODE: string;
@@ -16,7 +29,7 @@ export interface Env {
   REALTIME_APP_TOKEN: string;
   TURN_KEY_ID?: string;
   TURN_KEY_TOKEN?: string;
-  /** Son 31 gündeki tahmini SFU trafiği için üst sınır (GB). Varsayılan 800. */
+  /** Upper limit (GB) for the estimated SFU traffic of the last 31 days. Default 800. */
   USAGE_LIMIT_GB?: string;
 }
 
@@ -26,6 +39,7 @@ const CORS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
 };
 
+/** JSON response helper (with CORS headers). */
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -33,6 +47,7 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+/** The Worker entry point: every /api/* request is handed to the single Hub. */
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
@@ -40,7 +55,7 @@ export default {
     if (!url.pathname.startsWith("/api/")) {
       return new Response("goodbyedc sunucusu calisiyor", { headers: CORS });
     }
-    // 5-20 kişi için tek bir Hub yeterli.
+    // One Hub is plenty for 5–20 people.
     const hub = env.HUB.get(env.HUB.idFromName("main"));
     return hub.fetch(req);
   },
@@ -50,15 +65,17 @@ export default {
 
 type ChannelKind = "text" | "voice";
 
+/** What a voice participant publishes; stored in their socket's attachment. */
 interface VoiceInfo {
   channelId: number;
   sessionId: string;
-  tracks: string[]; // "mic", "screen"
+  tracks: string[]; // "mic", "screen", "music"
   muted: boolean;
   deafened: boolean;
-  watching: string | null; // ekranını izlediği oturum id'si
+  watching: string | null; // session id of the screen they are watching
 }
 
+/** Data attached to each WebSocket (survives hibernation). */
 interface Attachment {
   userId: number;
   username: string;
@@ -70,16 +87,21 @@ const HISTORY_PAGE = 50;
 const PBKDF2_ITERATIONS = 100_000;
 const RTC_BASE = "https://rtc.live.cloudflare.com/v1";
 
-// ---- Kullanım tahmini (bilerek yüksek tutulur) ----
-// SFU'dan bir istemciye giden bir ses akışı: Opus + RTP/UDP/IP ek yükü.
+// ---- Usage estimate (deliberately on the high side) ----
+// One audio stream from the SFU to a client: Opus + RTP/UDP/IP overhead.
 const AUDIO_BPS = 64_000;
-// Bir izleyiciye giden ekran görüntüsü: istemcideki 3 Mbps tavan + ek yük.
+// One screen stream to a viewer: the client's 3 Mbps cap + overhead.
 const SCREEN_BPS = 3_300_000;
+// Shared app audio (music): up to 128 kbps + overhead.
 const MUSIC_BPS = 140_000;
 const WINDOW_DAYS = 31;
 const USAGE_TICK_MS = 60_000;
 const LIMIT_MSG = "Son 31 günün ücretsiz trafik sınırına ulaşıldı. Sesli sohbet geçici olarak kapalı.";
 
+/**
+ * The Hub Durable Object. `this.sql` is its SQLite database, `this.ctx` gives
+ * access to storage, alarms and the hibernatable WebSockets.
+ */
 export class Hub extends DurableObject<Env> {
   sql: SqlStorage;
 
@@ -133,7 +155,7 @@ export class Hub extends DurableObject<Env> {
         created_at INTEGER NOT NULL
       );
     `);
-    // İlk çalıştırmada varsayılan sunucu.
+    // On first run, create the default server.
     const count = this.sql.exec("SELECT COUNT(*) AS c FROM servers").one().c as number;
     if (count === 0) {
       const now = Date.now();
@@ -145,12 +167,13 @@ export class Hub extends DurableObject<Env> {
         sid, now, sid, now,
       );
     }
-    // Hibernation sırasında DO'yu uyandırmadan ping'e cevap ver.
+    // Answer pings without waking the DO from hibernation.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   // ------------------------------------------------------------------ HTTP
 
+  /** HTTP router for /api/* (login, register, ICE servers, SFU proxy, WebSocket upgrade). */
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -174,6 +197,7 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
+  /** Creates an account (requires the invite code) and returns a login token. */
   async register(req: Request): Promise<Response> {
     const body = (await req.json()) as { username?: string; password?: string; invite?: string };
     const username = (body.username ?? "").trim();
@@ -199,6 +223,7 @@ export class Hub extends DurableObject<Env> {
     return json({ token: this.newToken(id), user: { id, username } });
   }
 
+  /** Checks username + password and returns a new login token. */
   async login(req: Request): Promise<Response> {
     const body = (await req.json()) as { username?: string; password?: string };
     const rows = this.sql
@@ -218,6 +243,7 @@ export class Hub extends DurableObject<Env> {
     return token;
   }
 
+  /** Finds the user a login token belongs to (null = invalid token). */
   userByToken(token: string | null): { id: number; username: string } | null {
     if (!token) return null;
     const row = this.sql
@@ -233,6 +259,7 @@ export class Hub extends DurableObject<Env> {
 
   // ---------------------------------------------------------- Realtime SFU
 
+  /** Short-lived STUN/TURN credentials for WebRTC (helps connect through NAT/firewalls). */
   async iceServers(): Promise<Response> {
     const servers: unknown[] = [{ urls: ["stun:stun.cloudflare.com:3478"] }];
     if (this.env.TURN_KEY_ID && this.env.TURN_KEY_TOKEN) {
@@ -251,13 +278,13 @@ export class Hub extends DurableObject<Env> {
   }
 
   /**
-   * İstemciden gelen SFU isteklerini Cloudflare Realtime API'sine iletir.
-   * İzin verilen uç noktalar:
+      * Forwards SFU requests from clients to the Cloudflare Realtime API.
+      * Allowed endpoints:
    *   POST /sessions/new
    *   POST /sessions/:id/tracks/new
    *   PUT  /sessions/:id/renegotiate
    *   PUT  /sessions/:id/tracks/close
-   * Kullanıcı sadece kendi oluşturduğu oturumlar üzerinde işlem yapabilir.
+      * Users may only operate on sessions they created themselves.
    */
   async rtcProxy(req: Request, sub: string, userId: number): Promise<Response> {
     if (!this.env.REALTIME_APP_ID || !this.env.REALTIME_APP_TOKEN) {
@@ -277,7 +304,7 @@ export class Hub extends DurableObject<Env> {
           "INSERT OR REPLACE INTO rtc_sessions (session_id, user_id, created_at) VALUES (?, ?, ?)",
           data.sessionId, userId, Date.now(),
         );
-        // Eski oturum kayıtlarını temizle (1 günden eski).
+        // Clean up old session records (older than 1 day).
         this.sql.exec("DELETE FROM rtc_sessions WHERE created_at < ?", Date.now() - 86_400_000);
       }
       return json(data, r.status);
@@ -304,6 +331,7 @@ export class Hub extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
+    // Hibernatable WebSocket: the DO may sleep while the socket stays open.
     this.ctx.acceptWebSocket(server);
     const att: Attachment = { userId: user.id, username: user.username, voice: null };
     server.serializeAttachment(att);
@@ -321,6 +349,7 @@ export class Hub extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  /** Handles one message from a client (chat message, history request, voice updates...). */
   async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
     if (typeof raw !== "string") return;
     let msg: any;
@@ -451,6 +480,7 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
+  /** A client disconnected: drop them from voice and update everyone. */
   async webSocketClose(ws: WebSocket): Promise<void> {
     await this.onSocketGone(ws);
   }
@@ -477,6 +507,7 @@ export class Hub extends DurableObject<Env> {
     return this.ctx.getWebSockets().filter((s) => s !== exclude && s.readyState === WebSocket.OPEN);
   }
 
+  /** Everyone currently in a voice channel (read from all sockets' attachments). */
   voiceState(exclude?: WebSocket) {
     const out: Array<{ userId: number; username: string } & VoiceInfo> = [];
     for (const s of this.sockets(exclude)) {
@@ -500,9 +531,9 @@ export class Hub extends DurableObject<Env> {
     this.broadcast({ t: "voice", voice: this.voiceState(exclude), usage: this.usageInfo() }, exclude);
   }
 
-  // ---------------------------------------------------------- kullanım
+  // ---------------------------------------------------------- usage
 
-  /** Dakikada bir: biriken trafiği yaz, sınırı kontrol et. */
+  /** Runs once a minute: record accumulated traffic, check the limit. */
   async alarm(): Promise<void> {
     await this.updateUsage();
     if (this.voiceState().length) {
@@ -519,16 +550,16 @@ export class Hub extends DurableObject<Env> {
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", key, value);
   }
 
-  /** Mevcut ses durumuna göre SFU'dan istemcilere giden tahmini bit/sn. */
+  /** Estimated bits per second from the SFU to clients, given the current voice state. */
   computeRate(voice: Array<{ channelId: number; sessionId: string } & VoiceInfo>): number {
     let bps = 0;
     for (const p of voice) {
       const same = voice.filter((o) => o.channelId === p.channelId && o.sessionId !== p.sessionId);
-      // p, kanaldaki herkesin mikrofonunu çeker.
+      // p pulls the microphone of everyone else in the channel.
       bps += same.filter((o) => o.tracks.includes("mic")).length * AUDIO_BPS;
-      // Paylaşılan uygulama sesi (müzik), herkes çeker.
+      // Shared app audio (music): everyone pulls it.
       bps += same.filter((o) => o.tracks.includes("music")).length * MUSIC_BPS;
-      // p birinin ekranını izliyorsa.
+      // If p is watching someone's screen.
       if (p.watching && same.some((o) => o.sessionId === p.watching && o.tracks.includes("screen"))) {
         bps += SCREEN_BPS;
       }
@@ -536,7 +567,7 @@ export class Hub extends DurableObject<Env> {
     return bps;
   }
 
-  /** Son güncellemeden bu yana geçen trafiği ekler ve yeni hızı kaydeder. */
+  /** Adds the traffic since the last update and stores the new rate. */
   async updateUsage(exclude?: WebSocket) {
     const now = Date.now();
     const last = Number(this.getKV("usage_last") ?? now);
@@ -563,7 +594,7 @@ export class Hub extends DurableObject<Env> {
     this.sql.exec("DELETE FROM usage_daily WHERE day < ?", dayOffset(-40));
   }
 
-  /** Sınır aşıldı: herkesi ses kanalından çıkar. */
+  /** Over the limit: remove everyone from voice. */
   disableVoice(exclude?: WebSocket) {
     for (const s of this.sockets(exclude)) {
       const a = s.deserializeAttachment() as Attachment | null;
@@ -591,7 +622,7 @@ export class Hub extends DurableObject<Env> {
     return this.usedBytes() >= this.limitBytes();
   }
 
-  /** Bir sonraki gece yarısında (UTC) 31 günlük pencereden çıkacak günün trafiği. */
+  /** Traffic of the day that leaves the 31-day window at the next midnight (UTC). */
   nextDropBytes(): number {
     const row = this.sql
       .exec("SELECT COALESCE(SUM(bytes), 0) AS b FROM usage_daily WHERE day = ?", dayOffset(-(WINDOW_DAYS - 1)))
@@ -605,7 +636,7 @@ export class Hub extends DurableObject<Env> {
     return {
       usedGB: +(this.usedBytes() / 1e9).toFixed(2),
       limitGB: this.limitBytes() / 1e9,
-      // Pencere kayıyor: her gece yarısı (UTC) en eski günün trafiği düşer.
+      // The window slides: every midnight (UTC) the oldest day's traffic drops out.
       nextDropGB: +(this.nextDropBytes() / 1e9).toFixed(2),
       nextDropAt: next.getTime(),
       windowDays: WINDOW_DAYS,
@@ -622,10 +653,12 @@ export class Hub extends DurableObject<Env> {
   }
 }
 
+/** Date string (YYYY-MM-DD, UTC) `days` days from today. */
 function dayOffset(days: number): string {
   return new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 }
 
+/** Keeps only known track names from client input. */
 function sanitizeTracks(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   return v.filter((t) => t === "mic" || t === "screen" || t === "music");
@@ -636,6 +669,7 @@ function randomHex(bytes: number): string {
   return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** PBKDF2-SHA256 password hash (passwords are never stored in plain text). */
 async function hashPassword(password: string, saltHex: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
   const salt = new Uint8Array(saltHex.match(/../g)!.map((h) => parseInt(h, 16)));

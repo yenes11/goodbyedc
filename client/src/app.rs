@@ -1,4 +1,19 @@
-//! Uygulama durumu ve arayüz (egui).
+//! App state and the user interface (egui).
+//!
+//! How this file is organized:
+//!   - Small helper types (ChannelMsgs, MyVoice, Modal, ...) and the big `App`
+//!     struct that holds *all* UI state.
+//!   - "Events": `handle_events` applies what the background sent (server messages,
+//!     voice joined, previews...), `handle_server` handles each server message.
+//!   - "Actions": methods that change state and send commands (join voice, mute...).
+//!   - "Drawing": `impl eframe::App for App` — eframe calls `ui()` every frame, and
+//!     it draws the whole window from the current state (immediate mode).
+//!   - Free functions at the bottom for repeated pieces (channel row, message row...).
+//!
+//! A key Rust idea used everywhere here: `&mut self` methods get exclusive
+//! (mutable) access to the App while they run. The borrow checker makes sure no
+//! other code reads or writes the App at the same time, so there are no data
+//! races — the UI state is only ever touched on the UI thread.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -20,13 +35,18 @@ use crate::theme::*;
 use crate::voice::{level_db, music_owner, Gate, Levels, Participant};
 use crate::widgets::{self, Tone};
 
-/// Üst çubukların yüksekliği (macOS pencere düğmeleri bunun ortasına yerleşir).
+/// Height of the top bars (the macOS window buttons are centered in it).
 const BAR: f32 = 46.0;
+/// Sidebar width.
 const SIDEBAR_W: f32 = 248.0;
+/// Audio level above which someone counts as "speaking" (green ring).
 const SPEAK_LEVEL: f32 = 0.02;
+/// How often to check for updates automatically.
 const UPDATE_EVERY: Duration = Duration::from_secs(30 * 60);
+/// `cfg!(...)` is evaluated at compile time to a plain `true`/`false`.
 const IS_MAC: bool = cfg!(target_os = "macos");
 
+/// Messages loaded for one channel.
 #[derive(Default)]
 struct ChannelMsgs {
     list: Vec<Message>,
@@ -34,27 +54,51 @@ struct ChannelMsgs {
     loading: bool,
 }
 
+/// Our own voice state while in a voice channel.
 struct MyVoice {
     channel_id: i64,
     session_id: String,
     tracks: Vec<String>,
 }
 
+/// Tabs of the screen-share window.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceTab {
     Screens,
     Windows,
 }
 
+/// Preview state of a link posted in chat.
+enum PreviewState {
+    Loading,
+    Ready(PreviewView),
+    /// No preview (the page gave no info or couldn't be opened).
+    Empty,
+}
+
+/// A ready preview: texts plus the image uploaded to the GPU as a texture.
+struct PreviewView {
+    site: Option<String>,
+    title: Option<String>,
+    desc: Option<String>,
+    image: Option<TextureHandle>,
+}
+
+/// Link color that's readable on the dark background.
+const LINK: Color32 = Color32::from_rgb(0x5b, 0x9b, 0xff);
+
+/// Which modal (dialog window) is open, with the state it needs.
+/// `App.modal` is an `Option<Modal>`: `None` = no modal open.
 enum Modal {
     CreateChannel { kind: &'static str, name: String },
     DeleteChannel { id: i64, name: String },
     ScreenShare { sources: Option<Vec<SourceInfo>>, tab: SourceTab, selected: Option<String> },
     Settings,
-    /// Uygulama sesi paylaş (ör. Spotify).
+    /// Share app audio (e.g. Spotify).
     AudioShare { apps: Option<Vec<AppAudio>>, selected: Option<u32> },
 }
 
+/// Contents of the login / register form.
 struct AuthForm {
     username: String,
     password: String,
@@ -64,6 +108,8 @@ struct AuthForm {
     busy: bool,
 }
 
+/// All of the app's state. eframe keeps one `App` alive for the whole run and
+/// calls its `ui` method every frame.
 pub struct App {
     backend: Backend,
     settings: Settings,
@@ -81,28 +127,30 @@ pub struct App {
     server_id: Option<i64>,
     channel_id: Option<i64>,
     messages: HashMap<i64, ChannelMsgs>,
-    /// Eski mesajlar başa eklenince kaydırma konumunu korumak için önceki içerik yüksekliği.
+    /// Content height before older messages were prepended (to keep the scroll position).
     scroll_fix: Option<f32>,
-    /// Bu kadar kare boyunca sohbeti en alta kaydır (kanal açılınca / ilk yüklemede).
+    /// Scroll the chat to the bottom for this many frames (when a channel opens / first loads).
     scroll_bottom: u8,
     last_content_h: f32,
     composer: String,
 
     my_voice: Option<MyVoice>,
-    /// Bağlanılmakta olan ses kanalı.
+    /// Voice channel we're currently joining.
     voice_joining: Option<i64>,
-    /// Ekran paylaşımı başlatılıyor/durduruluyor.
+    /// Screen sharing is starting/stopping.
     screen_busy: bool,
-    /// Ses paylaşımı başlatılıyor/durduruluyor.
+    /// App-audio sharing is starting/stopping.
     music_busy: bool,
     watching: Option<String>,
     screen_tex: Option<(String, TextureHandle)>,
     speaking: HashSet<String>,
-    /// Son ölçülen ses seviyeleri (ayarlar penceresindeki gösterge için).
+    /// Link previews (url -> state).
+    previews: HashMap<String, PreviewState>,
+    /// Last measured audio levels (for the meter in the settings window).
     levels: Levels,
-    /// Ayarlardaki mikrofon testi ("kendi sesini duy") açıksa.
+    /// The microphone test in settings ("hear yourself"), while running.
     mic_test: Option<crate::mictest::MicTest>,
-    /// Mikrofon testinin son ölçtüğü seviye (0..1).
+    /// Level last measured by the microphone test (0..1).
     mic_test_level: f32,
 
     modal: Option<Modal>,
@@ -119,6 +167,8 @@ pub struct App {
 }
 
 impl App {
+    /// Called once when the window opens. `cc` gives access to the egui context
+    /// (fonts, textures, ...).
     pub fn new(cc: &eframe::CreationContext<'_>, backend: Backend) -> Self {
         setup_fonts(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
@@ -170,6 +220,7 @@ impl App {
             watching: None,
             screen_tex: None,
             speaking: HashSet::new(),
+            previews: HashMap::new(),
             levels: Levels::default(),
             mic_test: None,
             mic_test_level: 0.0,
@@ -185,23 +236,26 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------ yardımcılar
+    // ------------------------------------------------------------ helpers
 
+    /// Shows a short message at the bottom of the window for a few seconds.
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some((text.into(), error, Instant::now()));
     }
 
+    /// Sends a JSON message to the server over the WebSocket.
     fn ws(&self, v: serde_json::Value) {
         self.backend.ws(v);
     }
 
+    /// Looks up a channel by id. Returns a *borrowed* `&Channel` (no copy).
     fn channel(&self, id: i64) -> Option<&Channel> {
         self.channels.iter().find(|c| c.id == id)
     }
 
-    // --------------------------------------------------------------- olaylar
+    // --------------------------------------------------------------- events
 
-    /// Geliştirme: GOODBYEDC_DEMO ile belirli bir pencereyi açık başlat (ekran görüntüsü testleri için).
+    /// Development: open a specific window at startup with GOODBYEDC_DEMO (for screenshot tests).
     #[cfg(debug_assertions)]
     fn demo(&mut self) {
         let Ok(d) = std::env::var("GOODBYEDC_DEMO") else { return };
@@ -230,7 +284,7 @@ impl App {
                 }
             }
             "fill" => {
-                // Kaydırma testi için kanala sahte mesajlar ekle.
+                // Fill the channel with fake messages for scroll testing.
                 if let Some(ch) = self.channel_id {
                     let c = self.messages.entry(ch).or_default();
                     if !c.loading && c.list.len() < 50 {
@@ -263,6 +317,10 @@ impl App {
         }
     }
 
+    /// Applies everything the background sent since the last frame, then updates
+    /// derived state (who is speaking, new screen frame, volumes for the voice loop).
+    /// `try_recv` takes one waiting event without blocking; `while let` repeats until
+    /// the queue is empty.
     fn handle_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.backend.events.try_recv() {
             match ev {
@@ -289,7 +347,7 @@ impl App {
                 }
                 Event::VoiceJoinFailed => self.voice_joining = None,
                 Event::VoiceLeft => {
-                    // Arka plan bağlantıyı kendisi bıraktıysa (yeniden bağlanılamadı) arayüzü de güncelle.
+                    // The background left voice by itself (rejoining failed): update the UI too.
                     if self.my_voice.take().is_some() {
                         self.ws(json!({ "t": "voice_leave" }));
                         self.watching = None;
@@ -305,9 +363,22 @@ impl App {
                         self.ws(json!({ "t": "voice_update", "tracks": tracks }));
                     }
                 }
+                Event::Preview { url, preview } => {
+                    let state = match preview {
+                        Some(p) => {
+                            let image = p.image.map(|(w, h, rgba)| {
+                                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                                ctx.load_texture(format!("onizleme:{url}"), img, TextureOptions::LINEAR)
+                            });
+                            PreviewState::Ready(PreviewView { site: p.site, title: p.title, desc: p.desc, image })
+                        }
+                        None => PreviewState::Empty,
+                    };
+                    self.previews.insert(url, state);
+                }
                 Event::AudioApps(list) => {
                     if let Some(Modal::AudioShare { apps, selected }) = &mut self.modal {
-                        // Spotify varsa onu seç, yoksa ilkini.
+                        // Pick Spotify if it's there, otherwise the first app.
                         *selected = list
                             .iter()
                             .find(|a| a.name.to_lowercase().contains("spotify"))
@@ -353,17 +424,17 @@ impl App {
             }
         }
 
-        // Ses ayarlarını ses döngüsüne ilet (hassasiyet ve kişilere özel yükseklik).
+        // Pass audio settings to the voice loop (sensitivity and per-user volumes).
         *self.backend.shared.gate.lock() =
             Gate { auto: self.settings.input_auto, threshold_db: self.settings.input_threshold_db };
         self.backend.shared.music_normalize.store(self.settings.music_normalize, Ordering::Relaxed);
 
-        // Mikrofon testi yalnızca ayarlar penceresi açıkken çalışır.
+        // The microphone test only runs while the settings window is open.
         if !matches!(self.modal, Some(Modal::Settings)) {
             self.mic_test = None;
         }
         if let Some(t) = &self.mic_test {
-            // Ölçüm tepe değer; gösterge yumuşak düşsün.
+            // The measurement is a peak value; let the meter fall smoothly.
             self.mic_test_level = t.take_level().max(self.mic_test_level * 0.8);
             ctx.request_repaint_after(Duration::from_millis(50));
         } else {
@@ -383,7 +454,7 @@ impl App {
             *self.backend.shared.volumes.lock() = vols;
         }
 
-        // Konuşanlar
+        // Who is speaking
         let levels = self.backend.shared.levels.lock().clone();
         self.levels = levels.clone();
         self.speaking.clear();
@@ -398,7 +469,7 @@ impl App {
             }
         }
 
-        // İzlenen ekranın yeni karesi
+        // New frame of the watched screen
         if let Some(frame) = self.backend.shared.frame.lock().take() {
             if Some(&frame.owner) == self.watching.as_ref() {
                 let img = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
@@ -409,12 +480,13 @@ impl App {
             }
         }
 
-        // Düzenli güncelleme kontrolü
+        // Periodic update check
         if self.me.is_some() && self.last_update_check.is_none_or(|t| t.elapsed() > UPDATE_EVERY) {
             self.check_update(false);
         }
     }
 
+    /// Handles one message from the server. `match` must cover every variant of `ServerMsg`.
     fn handle_server(&mut self, m: ServerMsg) {
         match m {
             ServerMsg::Ready { me, servers, channels, voice, usage } => {
@@ -423,7 +495,7 @@ impl App {
                 self.channels = channels;
                 self.voice = voice;
                 self.usage = usage;
-                // Yeniden bağlandıysak ses durumumuzu tekrar bildir.
+                // If we reconnected, tell the server our voice state again.
                 if let Some(v) = &self.my_voice {
                     self.ws(json!({ "t": "voice_join", "channelId": v.channel_id, "sessionId": v.session_id,
                         "tracks": v.tracks, "muted": self.settings.muted, "deafened": self.settings.deafened }));
@@ -493,7 +565,7 @@ impl App {
         }
     }
 
-    // -------------------------------------------------------------- işlemler
+    // -------------------------------------------------------------- actions
 
     fn logout(&mut self) {
         self.leave_voice();
@@ -520,6 +592,7 @@ impl App {
         self.settings.save();
     }
 
+    /// Opens a text channel (and remembers it in the settings).
     fn select_channel(&mut self, id: i64) {
         self.channel_id = Some(id);
         self.scroll_bottom = 3;
@@ -532,6 +605,7 @@ impl App {
         }
     }
 
+    /// Joins a voice channel. The actual work happens in the background; we get `Event::VoiceJoined` back.
     fn join_voice(&mut self, channel_id: i64) {
         if self.voice_joining.is_some() || self.my_voice.as_ref().is_some_and(|v| v.channel_id == channel_id) {
             return;
@@ -561,9 +635,11 @@ impl App {
         }
     }
 
+    /// Tells the voice loop who is in our voice channel (and whose screen we watch),
+    /// so it can pull/unpull the right tracks.
     fn sync_voice(&mut self) {
         let Some(my) = &self.my_voice else { return };
-        // İzlediğimiz kişi paylaşımı bıraktıysa izlemeyi kapat.
+        // If the person we're watching stopped sharing, stop watching.
         if let Some(w) = &self.watching {
             let still = self
                 .voice
@@ -599,7 +675,7 @@ impl App {
 
     fn set_muted(&mut self, muted: bool) {
         self.settings.muted = muted;
-        // Sağırken susturmayı kaldırmak sağırlığı da kaldırır.
+        // Unmuting while deafened also undeafens.
         if !muted && self.settings.deafened {
             self.settings.deafened = false;
             self.backend.voice(VoiceCmd::SetDeafened(false));
@@ -672,9 +748,12 @@ impl App {
 }
 
 // =====================================================================
-// Çizim
+// Drawing
 // =====================================================================
 
+// `eframe::App` is the trait eframe uses to drive our app. Implementing its `ui`
+// method is all eframe needs: it calls it every frame (when something changed or
+// an animation is running) and shows whatever we draw.
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -704,7 +783,7 @@ impl eframe::App for App {
 }
 
 impl App {
-    // ---------------------------------------------------------- giriş ekranı
+    // ---------------------------------------------------------- login screen
 
     fn auth_screen(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default().frame(Frame::new().fill(BG_MAIN)).show(ui, |ui| {
@@ -812,8 +891,11 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------ ana ekran
+    // ------------------------------------------------------------ main screen
 
+    /// The logged-in layout: sidebar on the left, header + chat (or screen view) on
+    /// the right. egui "panels" take space from the window's edges: a left panel
+    /// first, then the `CentralPanel` fills whatever is left.
     fn main_screen(&mut self, ui: &mut Ui) {
         egui::Panel::left("sidebar")
             .exact_size(SIDEBAR_W)
@@ -822,13 +904,13 @@ impl App {
             .frame(Frame::new().fill(BG_SIDEBAR))
             .show(ui, |ui| self.sidebar(ui));
 
-        // Kenar çubuğu ile ana alan arasındaki çizgi
+        // The line between the sidebar and the main area
         let r = ui.max_rect();
         ui.painter().vline(r.left() + SIDEBAR_W, r.y_range(), Stroke::new(1.0, BORDER));
 
         egui::CentralPanel::default().frame(Frame::new().fill(BG_MAIN)).show(ui, |ui| {
-            // Üst çubuk, sohbet ve mesaj kutusu arasında boşluk olmasın: mesajlar kaydırılırken
-            // kenarlara kadar gitsin. Gereken boşluk kaydırılan içeriğin içinde (padding).
+            // No gaps between the top bar, the chat and the composer: messages should scroll
+            // all the way to the edges. The needed spacing is padding *inside* the scrolled content.
             ui.spacing_mut().item_spacing.y = 0.0;
             self.header(ui);
             let watching = self.watching.clone().and_then(|w| self.voice.iter().find(|v| v.session_id == w).cloned());
@@ -849,14 +931,14 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
-        // Üst kısım: pencere düğmeleri (macOS) ve sürükleme alanı
+        // Top part: window buttons (macOS) and the window drag area
         let top = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(SIDEBAR_W, BAR));
         widgets::drag_region(ui, top, "sidebar-drag");
         ui.painter().hline(top.x_range(), top.bottom() - 0.5, Stroke::new(1.0, BORDER));
         ui.add_space(BAR);
 
-        // Alt kısımlar önce yerleşir, kanal listesi kalan alanı kullanır.
-        // Bölümlerin üst çizgileri kenar çubuğunun tüm genişliği boyunca çizilir.
+        // Bottom parts are laid out first; the channel list uses the remaining space.
+        // The sections' top separator lines span the sidebar's full width.
         let line = |ui: &Ui, r: egui::Rect| {
             ui.painter().hline(r.x_range(), r.top() + 0.5, Stroke::new(1.0, BORDER));
         };
@@ -1016,7 +1098,7 @@ impl App {
             if speaking { TEXT_STRONG } else { MUTED },
         );
 
-        // Sağ taraf: CANLI etiketi ve durum ikonları
+        // Right side: the LIVE badge and status icons
         let mut right = rect.right() - 6.0;
         if u.sharing_screen() {
             let is_me = self.my_voice.as_ref().is_some_and(|v| v.session_id == u.session_id);
@@ -1060,7 +1142,7 @@ impl App {
             ui.painter().text(egui::pos2(right, rect.center().y), Align2::RIGHT_CENTER, icon, icon_font(14.0), RED);
             right -= 20.0;
         }
-        // Sesini kıstığımız/kapattığımız kişi
+        // Someone we've turned down/muted
         if let Some(v) = self.settings.user_volumes.get(&u.user_id.to_string()) {
             if *v < 0.995 {
                 let icon = if *v <= 0.0 { ph::SPEAKER_SLASH } else { ph::SPEAKER_LOW };
@@ -1077,7 +1159,7 @@ impl App {
         let sharing = v.tracks.iter().any(|t| t == "screen");
         let music = v.tracks.iter().any(|t| t == "music");
         let ch_name = self.channel(v.channel_id).map(|c| c.name.clone()).unwrap_or_default();
-        // Ping: bağlantı kalitesine göre renk ve sinyal ikonu.
+        // Ping: color and signal icon by connection quality.
         let rtt = self.levels.rtt_ms;
         let sig_color = match rtt {
             Some(r) if r < 80.0 => GREEN,
@@ -1087,7 +1169,7 @@ impl App {
         };
         let w = ui.available_width();
 
-        // Üst satır: sinyal, durum ve kanal / ping; sağda bağlantıyı kes.
+        // Top row: signal, status and channel / ping; disconnect on the right.
         ui.allocate_ui_with_layout(egui::vec2(w, 34.0), Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let r = ui.label(RichText::new(ph::BROADCAST).font(icon_font(20.0)).color(sig_color));
@@ -1112,7 +1194,7 @@ impl App {
         });
         ui.add_space(8.0);
 
-        // Alt satır: etiketli hap düğmeler (alttaki ikon düğmelerinden ayrışsın diye).
+        // Bottom row: labelled pill buttons (to look different from the icon buttons below).
         let gap = 8.0;
         let bw = (w - gap) / 2.0;
         ui.allocate_ui_with_layout(egui::vec2(w, 32.0), Layout::left_to_right(Align::Center), |ui| {
@@ -1172,7 +1254,7 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------ üst çubuk
+    // ------------------------------------------------------------ top bar
 
     fn header(&mut self, ui: &mut Ui) {
         let rect = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(ui.max_rect().width(), BAR));
@@ -1228,7 +1310,7 @@ impl App {
         });
     }
 
-    // --------------------------------------------------------------- sohbet
+    // --------------------------------------------------------------- chat
 
     fn chat(&mut self, ui: &mut Ui) {
         let Some(ch_id) = self.channel_id else { return };
@@ -1238,7 +1320,7 @@ impl App {
             self.ws(json!({ "t": "history", "channelId": ch_id }));
         }
 
-        // Mesaj kutusu altta
+        // The message composer at the bottom
         egui::Panel::bottom("composer")
             .show_separator_line(false)
             .frame(Frame::new().fill(BG_MAIN).inner_margin(Margin { left: 16, right: 16, top: 0, bottom: 18 }))
@@ -1268,12 +1350,15 @@ impl App {
 
         let scroll_fix = self.scroll_fix.take();
         let me_id = self.me.as_ref().map(|m| m.id);
+        let previews = &self.previews;
+        let mut wanted: Vec<String> = Vec::new();
         let Some(c) = self.messages.get(&ch_id) else { return };
         let (more, loading) = (c.more, c.loading);
         let mut area = ScrollArea::vertical().id_salt(("messages", ch_id)).stick_to_bottom(true).auto_shrink(false);
         if self.scroll_bottom > 0 {
             self.scroll_bottom -= 1;
-            // Çok büyük değer verilirse (f32::MAX) egui NaN üretip çöküyor; içerik yüksekliği yeter.
+            // A huge value (f32::MAX) makes egui produce NaN and crash; content height
+            // plus a margin is enough to reach the bottom.
             area = area.vertical_scroll_offset(self.last_content_h.max(0.0) + 100_000.0);
             ui.ctx().request_repaint();
         }
@@ -1301,14 +1386,24 @@ impl App {
                 let mut prev: Option<&Message> = None;
                 for m in &c.list {
                     let grouped = prev.is_some_and(|p| p.user_id == m.user_id && m.created_at - p.created_at < 5 * 60 * 1000);
-                    message_row(ui, m, grouped, Some(m.user_id) == me_id);
+                    message_row(ui, m, grouped, Some(m.user_id) == me_id, previews, &mut wanted);
                     prev = Some(m);
                 }
-                // Alt padding: son mesaj ile mesaj kutusu arası.
+                // Bottom padding: between the last message and the composer.
                 ui.add_space(16.0);
             });
 
-        // Eski mesajlar başa eklendiyse görünen yeri koru.
+        // Ask for previews of the links in the visible messages. (Done after the
+        // scroll area closure because inside it `self.messages` is borrowed, and Rust
+        // doesn't allow mutating `self.previews` through `self` at the same time.)
+        for url in wanted {
+            if !self.previews.contains_key(&url) {
+                self.previews.insert(url.clone(), PreviewState::Loading);
+                self.backend.send(Cmd::Preview(url));
+            }
+        }
+
+        // If older messages were prepended, keep the visible position.
         if let Some(old_h) = scroll_fix {
             let mut state = out.state;
             state.offset.y += out.content_size.y - old_h;
@@ -1317,7 +1412,7 @@ impl App {
         }
         self.last_content_h = out.content_size.y;
 
-        // En üste yaklaşınca eski mesajları iste.
+        // Close to the top: load older messages.
         if out.state.offset.y < 40.0 && more && !loading && out.content_size.y > out.inner_rect.height() {
             if let Some(c) = self.messages.get_mut(&ch_id) {
                 if let Some(first) = c.list.first() {
@@ -1329,7 +1424,7 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------ ekran izleme
+    // ------------------------------------------------------------ screen viewing
 
     fn stage(&mut self, ui: &mut Ui, user: &VoiceUser) {
         egui::Panel::top("stage-top")
@@ -1362,13 +1457,17 @@ impl App {
         ui.allocate_rect(rect, Sense::hover());
     }
 
-    // -------------------------------------------------------------- pencereler
+    // -------------------------------------------------------------- dialogs
 
+    /// Draws the open modal, if any. The modal is *taken out* of `self.modal`
+    /// (`take()` leaves `None`), drawn, and put back as `next` if it should stay
+    /// open. Taking it out avoids borrowing `self.modal` while other `self` methods
+    /// are called inside the dialog.
     fn modals(&mut self, ctx: &egui::Context) {
         let Some(modal) = self.modal.take() else { return };
         let mut keep = true;
         let mut next: Option<Modal> = None;
-        // HeroUI Modal: koyu yüzey, çok ince açık kenar, büyük yuvarlaklık (28), geniş iç boşluk.
+        // HeroUI modal: dark surface, very thin light border, large radius (28), generous padding.
         let mut closed = false;
         let frame = Frame::new()
             .fill(SURFACE)
@@ -1414,7 +1513,7 @@ impl App {
                         }
                     }
                     Modal::DeleteChannel { id, name } => {
-                        // Açıklamada kanal adı kalın.
+                        // Channel name in bold inside the description.
                         let mut job = egui::text::LayoutJob::default();
                         let normal = egui::TextFormat { font_id: font(14.5), color: MUTED, ..Default::default() };
                         let strong = egui::TextFormat { font_id: bold_font(14.5), color: TEXT, ..Default::default() };
@@ -1583,7 +1682,7 @@ impl App {
                                 .color(MUTED),
                         );
                         ui.add_space(24.0);
-                        // Alt satır: solda sürüm, sağda düğmeler (ana işlem en sağda).
+                        // Bottom row: version on the left, buttons on the right (primary action rightmost).
                         ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), widgets::BUTTON_H), Layout::left_to_right(Align::Center), |ui| {
                             ui.label(RichText::new(format!("goodbyedc · {}", crate::update::version_label())).size(12.0).color(MUTED));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1605,8 +1704,8 @@ impl App {
                     }
                     Modal::ScreenShare { sources, mut tab, mut selected } => {
                         closed |= widgets::modal_header(ui, "Ekran paylaş", "Ses kanalındakilerin izleyeceği ekranı veya pencereyi seç.");
-                        // Sekmeler
-                        // HeroUI Tabs (solid): gri zemin, seçili sekme daha açık bir "imleç".
+                        // Tabs
+                        // HeroUI Tabs (solid): gray track, the selected tab is a lighter "cursor".
                         Frame::new()
                             .fill(BG_INPUT)
                             .corner_radius(20)
@@ -1718,7 +1817,7 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                // HeroUI Toast tarzı bildirim
+                // HeroUI toast-style notification
                 Frame::new()
                     .fill(SURFACE)
                     .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
@@ -1736,7 +1835,7 @@ impl App {
             });
     }
 
-    /// Geliştirme: GOODBYEDC_SCREENSHOT=dosya.ppm ise birkaç saniye sonra ekran görüntüsü alıp çıkar.
+    /// Development: with GOODBYEDC_SCREENSHOT=file.ppm, takes a screenshot after a few seconds and exits.
     #[cfg(debug_assertions)]
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
         let Some((path, frames)) = &mut self.screenshot else { return };
@@ -1764,13 +1863,14 @@ impl App {
     }
 }
 
-// ---------------------------------------------------------------- parçalar
+// ---------------------------------------------------------------- pieces
 
-/// Kanal satırı. (tıklandı mı, sil düğmesine basıldı mı)
+/// One channel row in the sidebar.
+/// Returns a tuple: (row clicked?, delete button clicked?).
 fn channel_row(ui: &mut Ui, icon: &str, name: &str, active: bool, loading: bool) -> (bool, bool) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     let hovered = resp.hovered() || ui.rect_contains_pointer(rect);
-    // HeroUI: seçili öğe ana rengin hafif tonu ve ana renkli yazı ("flat primary").
+    // HeroUI-style hover/selected background.
     let bg = if active { ACTIVE } else if hovered { HOVER } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, CornerRadius::same(16), bg);
     let fg = if active || hovered { TEXT_STRONG } else { MUTED };
@@ -1795,7 +1895,16 @@ fn channel_row(ui: &mut Ui, icon: &str, name: &str, active: bool, loading: bool)
     (resp.clicked() && !delete, delete)
 }
 
-fn message_row(ui: &mut Ui, m: &Message, grouped: bool, _mine: bool) {
+/// One chat message: avatar + name + time (unless `grouped` with the previous
+/// message from the same person), the text, and a link preview card.
+fn message_row(
+    ui: &mut Ui,
+    m: &Message,
+    grouped: bool,
+    _mine: bool,
+    previews: &HashMap<String, PreviewState>,
+    wanted: &mut Vec<String>,
+) {
     let left = 16.0;
     let avatar = 38.0;
     let text_x = left + avatar + 14.0;
@@ -1804,7 +1913,7 @@ fn message_row(ui: &mut Ui, m: &Message, grouped: bool, _mine: bool) {
     }
     let width = ui.available_width();
     let start = ui.cursor().min;
-    // Arka plan (üzerine gelince) için önce yer ayır, sonra içeriği çiz.
+    // Reserve a slot for the (hover) background first, draw the content, then fill the slot.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let inner = ui.scope_builder(
         egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
@@ -1819,7 +1928,22 @@ fn message_row(ui: &mut Ui, m: &Message, grouped: bool, _mine: bool) {
                     ui.label(RichText::new(fmt_time(m.created_at)).size(11.5).color(MUTED));
                 });
             }
-            ui.add(egui::Label::new(RichText::new(&m.content).size(14.5).color(TEXT)).wrap().selectable(true));
+            let urls = crate::preview::find_urls(&m.content);
+            if urls.is_empty() {
+                ui.add(egui::Label::new(RichText::new(&m.content).size(14.5).color(TEXT)).wrap().selectable(true));
+            } else {
+                message_text_with_links(ui, &m.content, &urls);
+                // Preview of the first link
+                let url = crate::preview::slice_chars(&m.content, urls[0]);
+                match previews.get(&url) {
+                    None => wanted.push(url),
+                    Some(PreviewState::Ready(v)) => {
+                        ui.add_space(4.0);
+                        preview_card(ui, &url, v);
+                    }
+                    _ => {}
+                }
+            }
         },
     );
     let h = inner.response.rect.height().max(if grouped { 0.0 } else { avatar });
@@ -1835,12 +1959,123 @@ fn message_row(ui: &mut Ui, m: &Message, grouped: bool, _mine: bool) {
     ui.add_space(3.0);
 }
 
-/// İki düğme yan yana, eşit genişlikte: Vazgeç / onay. (vazgeç, onay)
+/// Message text with underlined, clickable links.
+/// egui has no rich text with per-word click areas, so we lay the text out
+/// ourselves (`LayoutJob` = text plus formatting per section), then find which
+/// character is under the mouse to tell whether a link is hovered/clicked.
+fn message_text_with_links(ui: &mut Ui, text: &str, urls: &[(usize, usize)]) {
+    use egui::text::{LayoutJob, TextFormat};
+    let chars: Vec<char> = text.chars().collect();
+    let normal = TextFormat { font_id: font(14.5), color: TEXT, ..Default::default() };
+    let link = TextFormat { font_id: font(14.5), color: LINK, underline: Stroke::new(1.0, LINK), ..Default::default() };
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    let mut last = 0;
+    for &(a, b) in urls {
+        if a > last {
+            job.append(&chars[last..a].iter().collect::<String>(), 0.0, normal.clone());
+        }
+        job.append(&chars[a..b].iter().collect::<String>(), 0.0, link.clone());
+        last = b;
+    }
+    if last < chars.len() {
+        job.append(&chars[last..].iter().collect::<String>(), 0.0, normal);
+    }
+    let (pos, galley, resp) = egui::Label::new(job).sense(Sense::click()).layout_in_ui(ui);
+    // Which link is the mouse over?
+    let mut hovered: Option<String> = None;
+    if let Some(p) = resp.hover_pos() {
+        let rel = p - pos;
+        let on_text = galley.rows.iter().any(|r| r.rect().expand(1.0).contains(egui::pos2(rel.x, rel.y)));
+        if on_text {
+            let idx = galley.cursor_from_pos(rel).index.0;
+            if let Some(&(a, b)) = urls.iter().find(|&&(a, b)| idx >= a && idx < b) {
+                hovered = Some(chars[a..b].iter().collect());
+            }
+        }
+    }
+    ui.painter().galley(pos, galley, TEXT);
+    if let Some(url) = hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(&url));
+        }
+        resp.on_hover_text(url);
+    }
+}
+
+/// Link preview card: site name, title (clickable), description and image.
+fn preview_card(ui: &mut Ui, url: &str, v: &PreviewView) {
+    let max_w = ui.available_width().min(440.0);
+    let image_only = v.title.is_none() && v.desc.is_none();
+    let open = |ui: &Ui| ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    let image = |ui: &mut Ui, tex: &TextureHandle, max_w: f32| {
+        let size = tex.size_vec2();
+        let scale = (max_w / size.x).min(260.0 / size.y).min(1.0);
+        let r = ui.add(
+            egui::Image::new(tex)
+                .fit_to_exact_size(size * scale)
+                .corner_radius(8)
+                .sense(Sense::click()),
+        );
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        r.clicked()
+    };
+    if image_only {
+        if let Some(tex) = &v.image {
+            if image(ui, tex, max_w) {
+                open(ui);
+            }
+        }
+        return;
+    }
+    let resp = Frame::new()
+        .fill(Color32::from_rgb(0x22, 0x23, 0x24))
+        .corner_radius(10)
+        .inner_margin(Margin { left: 14, right: 12, top: 10, bottom: 12 })
+        .show(ui, |ui| {
+            ui.set_max_width(max_w - 26.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            if let Some(site) = &v.site {
+                ui.label(RichText::new(site).size(12.0).color(MUTED));
+            }
+            if let Some(title) = &v.title {
+                let r = ui.add(egui::Label::new(RichText::new(title).font(bold_font(14.0)).color(LINK)).wrap().sense(Sense::click()));
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if r.clicked() {
+                    open(ui);
+                }
+            }
+            if let Some(desc) = &v.desc {
+                ui.add(egui::Label::new(RichText::new(desc).size(13.0).color(TEXT)).wrap());
+            }
+            if let Some(tex) = &v.image {
+                ui.add_space(6.0);
+                let w = ui.available_width();
+                if image(ui, tex, w) {
+                    open(ui);
+                }
+            }
+        });
+    // Thin accent bar on the left
+    let r = resp.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(r.min, egui::pos2(r.left() + 3.0, r.bottom())),
+        CornerRadius { nw: 10, sw: 10, ne: 0, se: 0 },
+        ACCENT,
+    );
+}
+
+/// Two buttons side by side: Cancel / confirm. Returns (cancel clicked, confirm clicked).
 fn modal_buttons(ui: &mut Ui, ok_text: &str, ok_enabled: bool) -> (bool, bool) {
     modal_buttons_inner(ui, ok_text, ok_enabled, false)
 }
 
-/// Tehlikeli işlem için: onay düğmesi kırmızı.
+/// For destructive actions: the confirm button is red.
 fn modal_buttons_danger(ui: &mut Ui, ok_text: &str) -> (bool, bool) {
     modal_buttons_inner(ui, ok_text, true, true)
 }
@@ -1848,7 +2083,8 @@ fn modal_buttons_danger(ui: &mut Ui, ok_text: &str) -> (bool, bool) {
 fn modal_buttons_inner(ui: &mut Ui, ok_text: &str, ok_enabled: bool, danger: bool) -> (bool, bool) {
     let mut cancel = false;
     let mut ok = false;
-    // HeroUI dialog altı: sağa yaslı, yazıya göre genişlikte iki düğme; ana işlem en sağda.
+    // HeroUI dialog footer: right-aligned buttons sized to their text; the primary
+    // action is rightmost.
     ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), widgets::BUTTON_H), Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         let w = widgets::button_width(ui, ok_text);
@@ -1863,8 +2099,8 @@ fn modal_buttons_inner(ui: &mut Ui, ok_text: &str, ok_enabled: bool, danger: boo
     (cancel, ok)
 }
 
-/// Trafik göstergesinin açıklaması: pencere kaydığı için tek bir sıfırlanma
-/// tarihi yok; her gece en eski günün trafiği hesaptan düşer.
+/// Tooltip text for the traffic meter: the window slides, so there is no single
+/// reset date; every night the oldest day's traffic drops out.
 fn usage_tooltip(u: &Usage) -> String {
     let days = u.window_days.unwrap_or(31);
     let mut text = format!(
@@ -1883,6 +2119,7 @@ fn usage_tooltip(u: &Usage) -> String {
     text
 }
 
+/// Shortens text to `max` characters, adding "…" (counts characters, not bytes).
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1891,7 +2128,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// "Bugün 14:05" veya "07.11.2026 14:05" (yerel saat).
+/// "Bugün 14:05" (today) or "07.11.2026 14:05" (local time).
 fn fmt_time(ms: i64) -> String {
     use chrono::{Local, TimeZone};
     let Some(t) = Local.timestamp_millis_opt(ms).single() else { return String::new() };

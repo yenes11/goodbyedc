@@ -1,5 +1,10 @@
-//! Ekran yakalama (gönderen taraf) ve gelen ekran görüntüsünü JPEG'e
-//! çevirme (izleyen taraf).
+//! Screen capture (sending side) and converting incoming screen frames into
+//! pixels for the UI (watching side).
+//!
+//! Video in WebRTC is usually in "I420" format (a YUV format: one brightness plane
+//! plus two smaller color planes). Screens give us BGRA pixels, so we convert
+//! BGRA -> I420 when sending and I420 -> RGBA when displaying, using libyuv
+//! (a fast C library bundled with libwebrtc).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -16,11 +21,13 @@ use libwebrtc::video_source::native::NativeVideoSource;
 use serde::Serialize;
 
 
-/// Gönderilen görüntünün en büyük genişliği (1080p).
+/// Largest size we send (1080p); bigger screens are scaled down.
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
+/// Frames per second we capture.
 pub const FPS: u64 = 30;
 
+/// A screen or window the user can share.
 #[derive(Serialize, Clone)]
 pub struct SourceInfo {
     pub id: u64,
@@ -37,19 +44,24 @@ fn source_type(kind: &str) -> DesktopCaptureSourceType {
 }
 
 fn options(kind: &str) -> DesktopCapturerOptions {
+    // `mut` is only needed on macOS (the extra line below); `allow(unused_mut)`
+    // silences the warning on other systems.
     #[allow(unused_mut)]
     let mut o = DesktopCapturerOptions::new(source_type(kind));
     o.set_include_cursor(true);
+    // Don't show macOS's own screen picker; we have our own list.
     #[cfg(target_os = "macos")]
     o.set_sck_system_picker(false);
     o
 }
 
+/// All screens and windows that can be shared.
 pub fn list_sources() -> Vec<SourceInfo> {
     let mut out = Vec::new();
     for kind in ["screen", "window"] {
         if let Some(cap) = DesktopCapturer::new(options(kind)) {
             for (i, s) in cap.get_source_list().into_iter().enumerate() {
+                // Screens often have no title: name them "Ekran 1", "Ekran 2", ...
                 let title = if s.title().is_empty() {
                     format!("Ekran {}", i + 1)
                 } else {
@@ -62,19 +74,23 @@ pub fn list_sources() -> Vec<SourceInfo> {
     out
 }
 
-/// Çalışan bir ekran yakalama. Drop edildiğinde durur.
+/// A running screen capture. Stops when dropped.
 pub struct Capture {
     stop: Arc<AtomicBool>,
+    /// `Option` so that `Drop` can `take()` the handle out and join the thread.
     thread: Option<JoinHandle<()>>,
 }
 
 impl Capture {
+    /// Starts capturing `source_id` and feeding frames into `video` (the source of
+    /// the WebRTC video track we're sending).
     pub fn start(source_id: u64, kind: String, video: NativeVideoSource) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        // The capture thread reports whether starting worked.
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
-        // DesktopCapturer kendi thread'inde yaşar.
+        // The DesktopCapturer lives on its own thread for its whole life.
         let thread = std::thread::Builder::new()
             .name("screen-capture".into())
             .spawn(move || {
@@ -88,22 +104,29 @@ impl Capture {
                     return;
                 }
                 let start = Instant::now();
+                // The callback runs for every captured frame. `match res` handles both
+                // the Ok (frame) and Err cases inline.
                 cap.start_capture(source, move |res| match res {
                     Ok(frame) => push_frame(&video, &frame, start),
                     Err(e) => log::debug!("capture error: {e:?}"),
                 });
                 let _ = init_tx.send(Ok(()));
 
+                // Ask for a new frame FPS times per second until stopped.
                 let interval = Duration::from_millis(1000 / FPS);
                 while !stop2.load(Ordering::Relaxed) {
                     let t = Instant::now();
                     cap.capture_frame();
+                    // Sleep for the rest of the frame interval. `checked_sub`
+                    // returns None instead of underflowing if capturing took longer.
                     if let Some(rest) = interval.checked_sub(t.elapsed()) {
                         std::thread::sleep(rest);
                     }
                 }
             })?;
 
+        // Wait (max 10 s) for the thread's verdict. Two error layers: timeout, and
+        // the String error sent by the thread (converted with `anyhow!(e)`).
         init_rx
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| anyhow!("Ekran yakalama başlatılamadı (zaman aşımı)"))?
@@ -115,26 +138,31 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Wait for the capture thread to finish so the capturer is fully closed.
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
 }
 
+/// Converts one captured frame to I420, scales it down if needed and hands it
+/// to WebRTC.
 fn push_frame(video: &NativeVideoSource, frame: &DesktopFrame, start: Instant) {
-    // I420 için genişlik/yükseklik çift olmalı.
+    // I420 needs even width/height. `& !1` clears the lowest bit (rounds down to even).
     let w = (frame.width() as u32) & !1;
     let h = (frame.height() as u32) & !1;
     if w == 0 || h == 0 {
         return;
     }
     let mut buf = I420Buffer::new(w, h);
+    // Strides = bytes per row of each plane (can be larger than the width).
     let (sy, su, sv) = buf.strides();
     let (y, u, v) = buf.data_mut();
-    // WebRTC DesktopFrame BGRA'dır; libyuv bunu "ARGB" olarak adlandırır.
+    // WebRTC's DesktopFrame is BGRA in memory; libyuv calls that layout "ARGB".
     yuv_helper::argb_to_i420(frame.data(), frame.stride(), y, sy, u, su, v, sv, w as i32, h as i32);
 
     if w > MAX_WIDTH || h > MAX_HEIGHT {
+        // Keep the aspect ratio: use the smaller of the two scale factors.
         let scale = f64::min(MAX_WIDTH as f64 / w as f64, MAX_HEIGHT as f64 / h as f64);
         let nw = ((w as f64 * scale) as i32) & !1;
         let nh = ((h as f64 * scale) as i32) & !1;
@@ -150,8 +178,8 @@ fn push_frame(video: &NativeVideoSource, frame: &DesktopFrame, start: Instant) {
     video.capture_frame(&vf);
 }
 
-/// Gelen bir video karesini JPEG'e çevirir (arayüzde göstermek için).
-/// Uzak ekran karesini RGBA piksellere çevirir (arayüzde doku olarak çizilir).
+/// Converts a received remote screen frame into RGBA pixels (drawn in the UI as a
+/// texture). Returns `(width, height, pixels)`, or `None` for an empty frame.
 pub fn frame_to_rgba(frame: &BoxVideoFrame) -> Option<(usize, usize, Vec<u8>)> {
     let i420 = frame.buffer.to_i420();
     let (w, h) = (i420.width(), i420.height());
@@ -160,8 +188,10 @@ pub fn frame_to_rgba(frame: &BoxVideoFrame) -> Option<(usize, usize, Vec<u8>)> {
     }
     let (sy, su, sv) = i420.strides();
     let (y, u, v) = i420.data();
+    // 4 bytes (R, G, B, A) per pixel.
     let mut rgba = vec![0u8; (w * h * 4) as usize];
-    // libyuv "ABGR" = bellekte R,G,B,A sırası.
+    // libyuv's "ABGR" means R, G, B, A byte order in memory (its names are
+    // little-endian word order, which looks reversed).
     yuv_helper::i420_to_abgr(y, sy, u, su, v, sv, &mut rgba, w * 4, w as i32, h as i32);
     Some((w as usize, h as usize, rgba))
 }

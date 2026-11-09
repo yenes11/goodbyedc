@@ -1,11 +1,17 @@
-//! Windows: ses kanalına girince diğer uygulamaların sesi kısılmasın.
+//! Windows: keep other apps' audio at full volume while we're in a voice channel.
 //!
-//! Windows, bir uygulama mikrofonu iletişim için açtığında diğer sesleri
-//! varsayılan olarak %80 kısar ("iletişim etkinliği"). Discord gibi bu
-//! uygulama da kendi ses oturumlarını bu davranıştan çıkarır.
+//! When an app opens the microphone for "communications", Windows by default
+//! lowers all other sounds by 80% ("ducking"; Sound settings > Communications).
+//! Like Discord, we opt our own audio sessions out of triggering that.
+//!
+//! The Windows audio APIs are COM interfaces, called through the `windows` crate.
+//! Every COM call is `unsafe` in Rust because the compiler can't verify it.
 
+// Compiled only on Windows. On other systems the empty version at the bottom is
+// used, so callers can call `ducking::disable()` everywhere without `#[cfg]`.
 #[cfg(windows)]
 pub fn disable() {
+    // `use` inside a function limits these imports to this function.
     use windows::core::Interface;
     use windows::Win32::Media::Audio::{
         eCapture, eRender, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -13,27 +19,40 @@ pub fn disable() {
     };
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 
-    // COM'u ayrı bir iş parçacığında kullan (tokio iş parçacıklarını etkilemesin).
+    // Use COM on a fresh thread so we don't change the COM mode of tokio's worker
+    // threads. `thread::spawn(closure)` starts a thread; `.join()` waits for it and
+    // returns what the closure returned (or an error if the thread panicked).
     let res = std::thread::spawn(|| unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // `?` returns the error from the closure if creating the enumerator fails.
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let mut done = 0;
+        // Both speakers (render) and microphones (capture).
         for flow in [eRender, eCapture] {
+            // `let Ok(x) = ... else { continue };` = skip this item on error.
             let Ok(devices) = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) else { continue };
             for i in 0..devices.GetCount().unwrap_or(0) {
                 let Ok(device) = devices.Item(i) else { continue };
+                // `Activate::<T>` uses "turbofish" syntax to say which interface we want.
                 let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
-                // Bu sürecin o aygıttaki varsayılan oturumu (WebRTC de bunu kullanır).
+                // This process's default audio session on that device (WebRTC uses it too).
                 let Ok(control) = manager.GetAudioSessionControl(None, 0) else { continue };
+                // `cast` asks the COM object for another interface it implements.
                 let Ok(control2) = control.cast::<IAudioSessionControl2>() else { continue };
+                // `true` = "opt out": this session won't duck other sounds.
                 if control2.SetDuckingPreference(true).is_ok() {
                     done += 1;
                 }
             }
         }
+        // Tell the compiler the closure's error type explicitly (it can't infer it).
         Ok::<_, windows::core::Error>(done)
     })
     .join();
+    // `match` checks every possible shape of the result:
+    //   Ok(Ok(n))  -> thread ran and COM calls worked
+    //   Ok(Err(e)) -> thread ran but a COM call failed
+    //   Err(_)     -> the thread panicked
     match res {
         Ok(Ok(n)) => log::info!("ses kısma kapatıldı ({n} oturum)"),
         Ok(Err(e)) => log::warn!("ses kısma kapatılamadı: {e}"),
@@ -41,5 +60,6 @@ pub fn disable() {
     }
 }
 
+/// Non-Windows: nothing to do.
 #[cfg(not(windows))]
 pub fn disable() {}

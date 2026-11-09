@@ -1,4 +1,13 @@
-//! Küçük, tekrar kullanılan arayüz parçaları.
+//! Small, reusable UI pieces (buttons, avatar, spinner, window controls, ...).
+//!
+//! How a custom egui widget works (immediate mode):
+//!   1. Reserve space: `ui.allocate_exact_size(size, Sense::click())` returns the
+//!      `Rect` we got and a `Response` describing this frame's interaction
+//!      (hovered? clicked? dragged?).
+//!   2. Paint: `ui.painter()` draws shapes/text inside that rect.
+//!   3. Return the `Response` so the caller can write `if widget(...).clicked() {}`.
+//! Everything runs again next frame; egui remembers nothing about the widget
+//! except small bits of state keyed by its id (like animation progress).
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Key, Rect, Response, Sense, Stroke, Ui, Vec2, ViewportCommand,
@@ -7,14 +16,20 @@ use egui_phosphor::regular as ph;
 
 use crate::theme::*;
 
+/// Visual variant of `icon_button`.
+/// Deriving `PartialEq, Eq` lets us compare tones with `==`; `Copy` lets us pass
+/// them around by value without `.clone()`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     Normal,
-    /// Kapalı (ör. mikrofon susturulmuş): kırmızı
+    /// "Off" (e.g. microphone muted): drawn in red.
     Off,
 }
 
-/// Kare ikon düğmesi.
+/// Round icon-only button (32x32), e.g. microphone / headphones / settings.
+///
+/// Parameters are borrowed: `&mut Ui` (we add things to the UI) and `&str`
+/// (we only read the texts).
 pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, tone: Tone) -> Response {
     let size = Vec2::splat(32.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -35,7 +50,7 @@ pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, tone: Tone) -> Respon
     resp.on_hover_text(tooltip)
 }
 
-/// Küçük ikon düğmesi (kategori "+" ve kanal silme gibi).
+/// Small icon button (the "+" next to channel categories).
 pub fn small_icon_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
     let rect = scaled(rect, press_scale(ui, &resp));
@@ -48,21 +63,25 @@ pub fn small_icon_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
     resp.on_hover_text(tooltip)
 }
 
-/// Mavi ana düğme (HeroUI "solid" primary): tam yuvarlak, basınca hafif küçülür.
-/// `loading` iken yanında dönen gösterge çıkar ve tıklanamaz.
+/// Blue primary button (HeroUI "solid" primary): pill-shaped, shrinks slightly
+/// while pressed.
+/// While `loading`, a spinner shows next to the text and it can't be clicked.
 pub fn accent_button(ui: &mut Ui, text: &str, width: f32, enabled: bool, loading: bool) -> Response {
     solid_button(ui, text, width, enabled, loading, ACCENT, ACCENT_HOVER)
 }
 
-/// Kırmızı (tehlikeli işlem) düğme.
-/// HeroUI "danger" rengi: lab(50.91% 62.27 37.59) = #DB3B3E.
-/// Üzerine gelince oklab'da %10 beyazla karışır (#E15451).
+/// Red button for destructive actions.
+/// HeroUI "danger" color: lab(50.91% 62.27 37.59) = #DB3B3E.
+/// On hover it is mixed with 10% white in oklab (#E15451).
 pub fn danger_button(ui: &mut Ui, text: &str, width: f32) -> Response {
     solid_button(ui, text, width, true, false, Color32::from_rgb(0xdb, 0x3b, 0x3e), Color32::from_rgb(0xe1, 0x54, 0x51))
 }
 
+/// Height shared by all text buttons.
 pub const BUTTON_H: f32 = 36.0;
 
+/// Shared implementation of the solid (filled) buttons. Private (no `pub`),
+/// so other files use `accent_button` / `danger_button` instead.
 fn solid_button(
     ui: &mut Ui,
     text: &str,
@@ -93,19 +112,22 @@ fn solid_button(
     resp
 }
 
-/// Basılıyken düğmenin küçülme oranı (HeroUI: basınca %97'ye iner, bırakınca geri döner).
+/// How much a button shrinks while pressed (HeroUI style: down to ~96%, then
+/// springs back). `animate_bool_with_time` gives a value that moves smoothly
+/// from 0 to 1 (and back) over 0.08 s whenever `down` changes; egui stores the
+/// animation state under the widget's id.
 pub fn press_scale(ui: &Ui, resp: &Response) -> f32 {
     let down = resp.is_pointer_button_down_on();
     let t = ui.ctx().animate_bool_with_time(resp.id.with("press"), down, 0.08);
     1.0 - 0.04 * t
 }
 
-/// Dikdörtgeni merkezinden ölçekler.
+/// Scales a rectangle around its center.
 pub fn scaled(rect: Rect, s: f32) -> Rect {
     Rect::from_center_size(rect.center(), rect.size() * s)
 }
 
-/// Yazıyı alanın ortasına çizer; `loading` ise solunda küçük dönen gösterge olur.
+/// Draws text centered in `rect`; with `loading`, a small spinner sits to its left.
 fn label_with_spinner(ui: &Ui, rect: Rect, text: &str, font: egui::FontId, color: Color32, loading: bool) {
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let gap = if loading { 14.0 + 8.0 } else { 0.0 };
@@ -118,7 +140,8 @@ fn label_with_spinner(ui: &Ui, rect: Rect, text: &str, font: egui::FontId, color
     ui.painter().galley(egui::pos2(left + gap, rect.center().y - galley.size().y / 2.0), galley, color);
 }
 
-/// Dönen gösterge: soluk bir halka üzerinde sabit uzunlukta dönen yay.
+/// The spinner: a fixed-length arc rotating over a faint ring.
+/// It asks for a repaint every frame while visible, so the animation keeps going.
 pub fn spin(ui: &Ui, rect: Rect, color: Color32) {
     ui.ctx().request_repaint();
     let r = rect.width().min(rect.height()) / 2.0 - 1.5;
@@ -137,21 +160,21 @@ pub fn spin(ui: &Ui, rect: Rect, color: Color32) {
     ui.painter().add(egui::Shape::line(pts, Stroke::new(w, color)));
 }
 
-/// Yerleşimde yer kaplayan dönen gösterge.
+/// A spinner that takes up space in the layout.
 pub fn spinner(ui: &mut Ui, size: f32, color: Color32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     spin(ui, rect, color);
     resp
 }
 
-/// Dönen gösterge, düğme boyutunda bir yuvada (ikon düğmesinin yerine).
+/// A spinner in a button-sized slot (shown instead of an icon button while busy).
 pub fn spinner_slot(ui: &mut Ui, size: f32, tooltip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     spin(ui, Rect::from_center_size(rect.center(), Vec2::splat(16.0)), MUTED);
     resp.on_hover_text(tooltip)
 }
 
-/// Kullanılabilir alanın ortasında dönen gösterge ve altında açıklama.
+/// A spinner centered in the available area, with a caption below it.
 pub fn loading_center(ui: &mut Ui, text: &str) {
     let rect = ui.available_rect_before_wrap();
     paint_loading(ui, rect, text);
@@ -164,7 +187,7 @@ pub fn paint_loading(ui: &Ui, rect: Rect, text: &str) {
     ui.painter().text(egui::pos2(c.x, c.y + 18.0), Align2::CENTER_CENTER, text, font(13.5), MUTED);
 }
 
-/// İkincil düğme (HeroUI "flat"): gri dolgulu, çerçevesiz.
+/// Secondary button (HeroUI "flat"): gray fill, no border.
 pub fn secondary_button(ui: &mut Ui, text: &str, width: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, BUTTON_H), Sense::click());
     let s = press_scale(ui, &resp);
@@ -178,7 +201,7 @@ pub fn secondary_button(ui: &mut Ui, text: &str, width: f32) -> Response {
     resp
 }
 
-/// Yuvarlak "hap" düğme (Güncelle gibi). `loading` iken içinde dönen gösterge olur.
+/// Small pill button (like "Güncelle"). While `loading`, a spinner shows inside.
 pub fn pill_button(ui: &mut Ui, text: &str, loading: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), bold_font(13.0), Color32::WHITE);
     let extra = if loading { 20.0 } else { 0.0 };
@@ -197,7 +220,7 @@ pub fn pill_button(ui: &mut Ui, text: &str, loading: bool) -> Response {
     resp
 }
 
-/// Baş harfli yuvarlak avatar. `speaking` ise yeşil halka çizilir.
+/// Round avatar with the name's first letter. If `speaking`, a green ring is drawn.
 pub fn avatar(ui: &mut Ui, name: &str, size: f32, speaking: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     paint_avatar(ui, rect, name, speaking);
@@ -215,7 +238,8 @@ pub fn paint_avatar(ui: &Ui, rect: Rect, name: &str, speaking: bool) {
     }
 }
 
-/// Bir alanı pencere sürükleme bölgesi yapar (çift tıklayınca büyüt/küçült).
+/// Makes an area drag the window (our frameless window has no title bar of its
+/// own). Double-click toggles maximize.
 pub fn drag_region(ui: &Ui, rect: Rect, id: &str) {
     let resp = ui.interact(rect, ui.id().with(id), Sense::click_and_drag());
     if resp.drag_started() {
@@ -227,7 +251,7 @@ pub fn drag_region(ui: &Ui, rect: Rect, id: &str) {
     }
 }
 
-/// Windows/Linux: küçült, büyüt, kapat düğmeleri.
+/// Windows/Linux: minimize, maximize and close buttons (we draw our own title bar).
 pub fn window_controls(ui: &mut Ui, height: f32) {
     let ctx = ui.ctx().clone();
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -236,7 +260,8 @@ pub fn window_controls(ui: &mut Ui, height: f32) {
         (if maximized { ph::COPY } else { ph::SQUARE }, if maximized { "Önceki boyut" } else { "Büyüt" }, 1),
         (ph::X, "Kapat", 2),
     ];
-    // Sağdan sola düzende ilk eklenen en sağa gelir: Kapat en sağda kalsın diye sırayı çevir.
+    // In a right-to-left layout the first item added ends up rightmost, so reverse
+    // the order to keep "Close" on the far right.
     let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
     let order: Vec<_> = if rtl { buttons.into_iter().rev().collect() } else { buttons.into_iter().collect() };
     for (icon, tip, kind) in order {
@@ -246,7 +271,7 @@ pub fn window_controls(ui: &mut Ui, height: f32) {
             (_, true) => (HOVER, TEXT_STRONG),
             _ => (Color32::TRANSPARENT, MUTED),
         };
-        // Diğer düğmelerle tutarlı: hover zemini hap şeklinde.
+        // Consistent with the other buttons: the hover background is a pill.
         let rect = scaled(Rect::from_center_size(slot.center(), egui::vec2(36.0, 28.0)), press_scale(ui, &resp));
         ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, icon_font(15.0), fg);
@@ -261,7 +286,9 @@ pub fn window_controls(ui: &mut Ui, height: f32) {
     }
 }
 
-/// Çerçevesiz pencerede kenarlardan boyutlandırma (Windows/Linux).
+/// Resizing a frameless window by dragging its edges (Windows/Linux).
+/// When the pointer is within 5 px of an edge we show a resize cursor, and on
+/// mouse-down ask the OS to start a native resize in that direction.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn resize_edges(ctx: &egui::Context) {
     use egui::{CursorIcon, ResizeDirection as D};
@@ -294,22 +321,22 @@ pub fn resize_edges(ctx: &egui::Context) {
     }
 }
 
-/// Enter'a basıldı mı (odak bu alandayken)?
+/// Was Enter pressed while this text field had focus?
 pub fn enter_pressed(ui: &Ui, resp: &Response) -> bool {
     resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
 }
 
-/// Kenar çubuğundaki grup başlığı (shadcn SidebarGroupLabel: küçük, soluk).
+/// Group title in the sidebar (like shadcn's SidebarGroupLabel: small, muted).
 pub fn section_label(ui: &mut Ui, text: &str) {
     ui.label(egui::RichText::new(text).font(bold_font(12.0)).color(MUTED));
 }
 
-/// Form alanı etiketi (shadcn Label: text-sm font-medium).
+/// Form field label (like shadcn's Label: text-sm, font-medium).
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(egui::RichText::new(text).font(bold_font(13.5)).color(TEXT_STRONG));
 }
 
-/// Açma/kapama anahtarı.
+/// On/off switch. `on: &mut bool` lets the switch flip the caller's variable directly.
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(46.0, 28.0), Sense::click());
     if resp.clicked() {
@@ -328,8 +355,9 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     resp
 }
 
-/// Discord'daki gibi giriş hassasiyeti çubuğu: anlık mikrofon seviyesi ve
-/// sürüklenebilir eşik. Değerler dB (-100..0).
+/// Input sensitivity bar like Discord's: live microphone level plus a draggable
+/// threshold handle.
+/// Values are in dB (-100..0).
 pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, editable: bool) -> Response {
     let (rect, mut resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), if editable { Sense::click_and_drag() } else { Sense::hover() });
@@ -351,10 +379,10 @@ pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, edita
     let p = ui.painter();
     let tx = to_x(*threshold_db).clamp(bar.left(), bar.right());
     let amber = Color32::from_rgb(0xd8, 0xa3, 0x3a);
-    // Eşiğin solu (iletilmez) sarı, sağı (iletilir) yeşil; soluk zemin.
+    // Left of the threshold (not transmitted) is amber, right (transmitted) is green; faint background.
     p.rect_filled(Rect::from_min_max(bar.min, egui::pos2(tx, bar.max.y)), CornerRadius::same(5), amber.gamma_multiply(0.25));
     p.rect_filled(Rect::from_min_max(egui::pos2(tx, bar.min.y), bar.max), CornerRadius::same(5), GREEN.gamma_multiply(0.25));
-    // Anlık seviye
+    // Live level
     let lx = to_x(level_db).clamp(bar.left(), bar.right());
     if lx > bar.left() + 1.0 {
         let left_end = lx.min(tx);
@@ -363,7 +391,7 @@ pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, edita
             p.rect_filled(Rect::from_min_max(egui::pos2(tx, bar.min.y), egui::pos2(lx, bar.max.y)), CornerRadius::same(5), GREEN);
         }
     }
-    // Eşik tutamacı
+    // Threshold handle
     let handle = Rect::from_center_size(egui::pos2(tx, rect.center().y), egui::vec2(6.0, 22.0));
     let hc = if editable { Color32::WHITE } else { MUTED };
     p.rect_filled(handle, CornerRadius::same(3), hc);
@@ -371,14 +399,15 @@ pub fn sensitivity_bar(ui: &mut Ui, threshold_db: &mut f32, level_db: f32, edita
     resp
 }
 
-/// HeroUI modal başlığı: solda büyük başlık, sağ üstte daire kapatma düğmesi,
-/// altında soluk açıklama. Kapatma düğmesine basıldıysa `true`.
+/// HeroUI-style modal header: large title on the left, round close button on the
+/// top right, muted description below. Returns `true` if the close button was clicked.
 pub fn modal_header(ui: &mut Ui, title: &str, desc: &str) -> bool {
     let desc = (!desc.is_empty()).then(|| egui::RichText::new(desc).size(14.5).color(MUTED).into());
     modal_header_rich(ui, title, desc)
 }
 
-/// Açıklaması biçimli (ör. kalın kelimeli) modal başlığı.
+/// Modal header with a formatted description (e.g. some words in bold).
+/// `egui::WidgetText` can hold either plain/rich text or a pre-built LayoutJob.
 pub fn modal_header_rich(ui: &mut Ui, title: &str, desc: Option<egui::WidgetText>) -> bool {
     let mut close = false;
     let w = ui.available_width();
@@ -404,14 +433,14 @@ pub fn modal_header_rich(ui: &mut Ui, title: &str, desc: Option<egui::WidgetText
     close
 }
 
-/// Yazıya göre düğme genişliği (iki yanda 18 px boşluk).
+/// Button width that fits the text (18 px padding on each side, minimum 80).
 pub fn button_width(ui: &Ui, text: &str) -> f32 {
     let g = ui.painter().layout_no_wrap(text.to_string(), font(14.0), Color32::WHITE);
     (g.size().x + 36.0).max(80.0)
 }
 
-/// Etiketli hap düğme (ses panelindeki "Ekran", "Ses" gibi): ikon + yazı, dolgulu.
-/// `on` iken yeşil tonlu; `loading` iken ikonun yerinde dönen gösterge.
+/// Labelled pill button ("Ekran", "Ses" in the voice panel): icon + text, filled.
+/// Green-tinted while `on`; a spinner replaces the icon while `loading`.
 pub fn action_pill(ui: &mut Ui, icon: &str, label: &str, width: f32, on: bool, loading: bool) -> Response {
     let (slot, resp) = ui.allocate_exact_size(egui::vec2(width, 32.0), if loading { Sense::hover() } else { Sense::click() });
     let s = if loading { 1.0 } else { press_scale(ui, &resp) };
@@ -441,7 +470,7 @@ pub fn action_pill(ui: &mut Ui, icon: &str, label: &str, width: f32, on: bool, l
     resp
 }
 
-/// Kırmızı tonlu daire düğme (bağlantıyı kes): her zaman kırmızı, üzerine gelince dolu kırmızı.
+/// Red-tinted round button (disconnect): always red, solid red on hover.
 pub fn danger_circle_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
     let (slot, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
     let rect = scaled(slot, press_scale(ui, &resp));

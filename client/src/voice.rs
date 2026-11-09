@@ -1,6 +1,21 @@
-//! Ses kanalı bağlantısı: tek bir PeerConnection üzerinden Cloudflare
-//! Realtime SFU'ya kendi mikrofonumuzu/ekranımızı gönderir (push) ve
-//! diğerlerininkini çeker (pull).
+//! The voice channel connection. Over a single WebRTC `PeerConnection` to
+//! Cloudflare's Realtime SFU it sends ("pushes") our own microphone, screen and
+//! shared app audio, and receives ("pulls") everyone else's.
+//!
+//! The big picture:
+//!   - `Call` is one voice session: created by `Call::join`, destroyed by `leave`.
+//!   - Our server tells every client who is in the channel and which tracks each
+//!     person publishes. `Call::sync` compares that list with what we currently
+//!     pull and pulls/unpulls the difference.
+//!   - Received audio is played automatically by WebRTC's audio device module
+//!     (the "ADM", which owns the speakers and microphone).
+//!   - `stats_loop` runs every 50 ms: it measures levels (who is speaking), opens
+//!     and closes our mic according to the sensitivity gate, applies per-user
+//!     volumes and detects stalled audio.
+//!   - `Shared` holds state that both the UI thread and WebRTC's own threads touch;
+//!     it's wrapped in `Arc` and protected by `Mutex`es / atomics.
+//!
+//! See sfu.rs for what "SDP", "track", "mid" and "renegotiation" mean.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,18 +39,23 @@ use tokio::task::JoinHandle;
 use crate::screen::{self, Capture};
 use crate::sfu::{Sdp, Sfu};
 
-/// Ekran izlerken arayüze aktarılan en yüksek kare hızı.
+/// Highest frame rate passed to the UI while watching a screen.
 const VIEW_FPS: u64 = 30;
 
-/// Arka plan görevlerinin çalıştığı tokio çalışma ortamı.
-/// WebRTC geri çağrıları (on_track gibi) kendi iş parçacıklarında çalışır; oradan
-/// `tokio::spawn` çağrılırsa program çöker. Bu yüzden görevler bu tutamaçla başlatılır.
+/// The tokio runtime our background tasks run on.
+/// WebRTC callbacks (like `on_track`) run on WebRTC's own threads; calling
+/// `tokio::spawn` there crashes the program because those threads don't belong to
+/// tokio. So tasks are started through this stored handle instead. It's a global
+/// (`static`) set once at startup by `set_runtime`.
 static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
 
 pub fn set_runtime(handle: tokio::runtime::Handle) {
     let _ = RUNTIME.set(handle);
 }
 
+/// Spawns a future on our runtime from any thread.
+/// Generic signature: `F` is any future that can move between threads (`Send`)
+/// and doesn't borrow temporary data (`'static`); its output must be `Send` too.
 fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
@@ -44,34 +64,34 @@ where
     RUNTIME.get().expect("tokio çalışma ortamı ayarlanmadı").spawn(fut)
 }
 
-/// İzlenen ekranın son karesi.
+/// The latest frame of the screen we're watching.
 pub struct ScreenFrame {
-    /// Ekranı paylaşanın oturum id'si.
+    /// Session id of the person sharing the screen.
     pub owner: String,
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
 }
 
-/// Ses seviyeleri (0..1): kendi mikrofonumuz ve oturum id'sine göre diğerleri.
+/// Audio levels (0..1): our own microphone, and everyone else by session id.
 #[derive(Default, Clone)]
 pub struct Levels {
     pub me: f32,
-    /// Mikrofon şu an ses gönderiyor mu (hassasiyet eşiğini geçti mi)?
+    /// Is the microphone transmitting right now (above the sensitivity threshold)?
     pub transmitting: bool,
-    /// Otomatik modda o anki eşik (dB).
+    /// The current threshold in automatic mode (dB).
     pub auto_threshold_db: f32,
-    /// Cloudflare sunucusuna gidiş-dönüş süresi (ms), ölçülebildiyse.
+    /// Round-trip time to Cloudflare's server (ms), if it could be measured.
     pub rtt_ms: Option<f32>,
     pub peers: HashMap<String, f32>,
 }
 
-/// Giriş hassasiyeti: mikrofon yalnızca ses bu eşiği geçince açılır.
+/// Input sensitivity (voice gate): the mic only opens when sound is above the threshold.
 #[derive(Clone, Copy)]
 pub struct Gate {
-    /// Otomatik: arka plan gürültüsüne göre eşik kendiliğinden ayarlanır.
+    /// Automatic: the threshold follows the background noise.
     pub auto: bool,
-    /// Elle ayarlanan eşik (dB, -100..0).
+    /// Manually chosen threshold (dB, -100..0).
     pub threshold_db: f32,
 }
 
@@ -81,12 +101,12 @@ impl Default for Gate {
     }
 }
 
-/// Bir oturumun müzik yayınının sahip anahtarı (ses ayarı ve seviyeler için).
+/// Owner key of a session's music stream (separate from its mic for volume and levels).
 pub fn music_owner(session: &str) -> String {
     format!("{session}#music")
 }
 
-/// 0..1 seviyeyi dB'ye çevirir (-100..0).
+/// Converts a 0..1 level to decibels (clamped to -100..0).
 pub fn level_db(level: f32) -> f32 {
     if level <= 0.00001 {
         -100.0
@@ -95,34 +115,40 @@ pub fn level_db(level: f32) -> f32 {
     }
 }
 
-/// Ses eşiği geçtikten sonra mikrofonun açık kalma süresi (kelime sonları kesilmesin).
+/// How long the mic stays open after the level drops below the threshold
+/// (so word endings aren't cut off).
 const GATE_HOLD: Duration = Duration::from_millis(600);
 
-/// Call ile paylaşılan, WebRTC callback'lerinden de erişilen durum.
+/// State shared between the UI, the `Call` and WebRTC's callback threads.
+///
+/// `#[derive(Default)]` builds it with every field at its default (false, empty
+/// maps, `None`). Each field has its own lock (`Mutex`) or is atomic, so different
+/// threads can touch different fields without blocking each other. `parking_lot::Mutex`
+/// is used (no poisoning, `.lock()` returns the guard directly).
 #[derive(Default)]
 pub struct Shared {
     pub deafened: AtomicBool,
     pub muted: AtomicBool,
-    /// Paylaşılan uygulama sesi gönderilmeden önce dengelensin mi?
+    /// Should shared app audio be normalized before sending?
     pub music_normalize: AtomicBool,
     pub gate: Mutex<Gate>,
-    /// Oturum id'si -> çalma yüksekliği (0..2, 1 = normal).
+    /// Session id -> playback volume (0..2, 1 = normal). Written by the UI every frame.
     pub volumes: Mutex<HashMap<String, f32>>,
-    /// mid -> uzak ses track'i (yüksekliği ayarlamak için)
+    /// mid -> remote audio track (to set its volume, mute it, ...).
     pub audio_tracks: Mutex<HashMap<String, RtcAudioTrack>>,
-    /// Bir süredir hiç veri gelmeyen (takılmış) ses track'lerinin mid'leri.
+    /// mids of audio tracks that haven't received data for a while (stalled).
     pub stalled: Mutex<HashSet<String>>,
-    /// WebRTC bağlantısının durumu ve bu duruma geçiş anı.
+    /// The WebRTC connection's state and when it entered that state.
     pub pc_state: Mutex<Option<(PeerConnectionState, Instant)>>,
-    /// mid -> uzak oturum id'si (görüntünün kime ait olduğunu bilmek için)
+    /// mid -> remote session id (to know whose audio/video a track is).
     pub mid_owner: Mutex<HashMap<String, String>>,
-    /// mid -> ekran izleme görevi
+    /// mid -> screen-viewing task.
     pub viewers: Mutex<HashMap<String, JoinHandle<()>>>,
-    /// İzlenen ekranın son karesi (arayüz alıp dokuya çevirir).
+    /// The latest frame of the watched screen (the UI takes it and turns it into a texture).
     pub frame: Mutex<Option<ScreenFrame>>,
-    /// Son ölçülen ses seviyeleri.
+    /// The most recently measured audio levels.
     pub levels: Mutex<Levels>,
-    /// Yeni veri gelince arayüzü yeniden çizdirmek için.
+    /// Used to make the UI repaint when new data arrives.
     pub repaint: Mutex<Option<eframe::egui::Context>>,
 }
 
@@ -136,12 +162,14 @@ impl Shared {
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
+/// One person in our voice channel, as the server describes them.
+/// `Deserialize` because it comes from JSON; `Clone` so `sync` can keep a copy.
 pub struct Participant {
     pub session_id: String,
     pub tracks: Vec<String>,
 }
 
-/// Paylaşılan uygulama sesi (ör. Spotify).
+/// Shared app audio being sent (e.g. Spotify).
 struct LocalMusic {
     _capture: crate::appaudio::Capture,
     pacer: JoinHandle<()>,
@@ -155,6 +183,8 @@ struct LocalScreen {
     mid: String,
 }
 
+/// One active voice session.
+/// The UI never holds a `Call` directly; it lives inside `voice_loop` in backend.rs.
 pub struct Call {
     sfu: Sfu,
     factory: PeerConnectionFactory,
@@ -163,24 +193,25 @@ pub struct Call {
     mic: RtcAudioTrack,
     screen: Option<LocalScreen>,
     music: Option<LocalMusic>,
-    /// "oturumId/trackAdı" -> mid
+    /// "sessionId/trackName" -> mid of every track we currently pull.
     pulled: HashMap<String, String>,
-    /// Son bilinen katılımcılar ve izlenen ekran (başarısız çekmeleri yeniden denemek için).
+    /// Last known participants and watched screen (to retry failed pulls later).
     last_sync: (Vec<Participant>, Option<String>),
-    /// Takıldığı için yeniden çekilen track'lerin son deneme anı.
+    /// When we last re-pulled a stalled track (avoids re-pulling too often).
     repulled: HashMap<String, Instant>,
-    /// SFU'da kapatılamamış (susturulmuş) track'lerin mid'leri.
+    /// mids of tracks we couldn't close on the SFU yet (muted; closing is retried).
     zombies: HashSet<String>,
     shared: Arc<Shared>,
     stats_task: JoinHandle<()>,
 }
 
 fn offer_options() -> OfferOptions {
-    // Varsayılan Some(false) değerleri, çektiğimiz (recvonly) track'leri
-    // devre dışı bırakırdı; None ile yönlerine dokunulmaz.
+    // The defaults (`Some(false)`) would disable the receive-only tracks we pull;
+    // with `None` WebRTC leaves their directions alone.
     OfferOptions { ice_restart: false, offer_to_receive_audio: None, offer_to_receive_video: None }
 }
 
+/// Converts the SFU's JSON SDP into libwebrtc's `SessionDescription`.
 fn parse(sdp: &Sdp) -> Result<SessionDescription> {
     let kind = match sdp.kind.as_str() {
         "offer" => SdpType::Offer,
@@ -191,6 +222,8 @@ fn parse(sdp: &Sdp) -> Result<SessionDescription> {
 }
 
 impl Call {
+    /// Joins voice: sets up the PeerConnection and the audio devices, creates an SFU
+    /// session and publishes our microphone. `muted` is the initial mute state.
     pub async fn join(factory: PeerConnectionFactory, sfu: Sfu, shared: Arc<Shared>, muted: bool) -> Result<Self> {
         let mut config = RtcConfiguration::default();
         config.ice_servers = sfu.ice_servers().await.unwrap_or_else(|e| {
@@ -214,13 +247,15 @@ impl Call {
         }
         {
             let shared = shared.clone();
+            // `Some(Box::new(closure))`: the callback is a boxed closure. `move` gives
+            // it its own clone of `shared` (an Arc), so it stays valid after this function.
             pc.on_track(Some(Box::new(move |ev: TrackEvent| on_track(&shared, ev))));
         }
 
-        // Windows diğer uygulamaların sesini kısmasın (aygıt açılmadan önce ve sonra).
+        // Keep Windows from lowering other apps' volume (before and after opening the devices).
         let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
 
-        // Gerçek mikrofon/hoparlör (platform ADM, yankı engelleme dahil).
+        // Real microphone/speakers (the platform ADM, including echo cancellation).
         if !factory.acquire_platform_adm() {
             return Err(anyhow!("Ses aygıtı başlatılamadı"));
         }
@@ -232,10 +267,12 @@ impl Call {
         let session_id = sfu.new_session().await?;
         let mic = factory.create_device_audio_track("mic");
         shared.muted.store(muted, Ordering::Relaxed);
-        // Hassasiyet döngüsü eşik geçilince açar.
+        // The gate in `stats_loop` opens it once the level is above the threshold.
         mic.set_enabled(false);
 
-        // Mikrofon seviyesini ayrıca ölç (WebRTC, track kapalıyken ölçmüyor).
+        // Measure the mic level separately (WebRTC doesn't measure while the track is
+        // disabled). `spawn_blocking` runs the blocking `Meter::start` on a thread meant
+        // for blocking work, so it doesn't stall the async runtime.
         let meter = tokio::task::spawn_blocking(crate::meter::Meter::start).await.ok().flatten();
         if meter.is_none() {
             log::warn!("mikrofon ölçer yok: giriş hassasiyeti devre dışı, mikrofon hep açık");
@@ -256,6 +293,7 @@ impl Call {
             shared,
             stats_task,
         };
+        // Publish our microphone to the SFU as track "mic".
         let tr = call.add_send_transceiver(MediaStreamTrack::Audio(mic), vec![])?;
         call.push_track(&tr, "mic").await.context("mikrofon gönderilemedi")?;
         Ok(call)
@@ -278,7 +316,7 @@ impl Call {
             .map_err(|e| anyhow!("{e}"))
     }
 
-    /// Yerel bir transceiver'ı SFU'ya "trackName" adıyla yayınlar.
+    /// Publishes a local transceiver to the SFU under the name `name` ("mic", "screen", "music").
     async fn push_track(&self, tr: &RtpTransceiver, name: &str) -> Result<String> {
         let offer = self.pc.create_offer(offer_options()).await.map_err(|e| anyhow!("{e}"))?;
         self.pc.set_local_description(offer.clone()).await.map_err(|e| anyhow!("{e}"))?;
@@ -298,7 +336,7 @@ impl Call {
         Ok(mid)
     }
 
-    /// SFU'nun gönderdiği offer'a cevap verir.
+    /// Answers an offer the SFU sent (renegotiation initiated by the SFU).
     async fn answer_offer(&self, offer: &Sdp) -> Result<()> {
         self.pc.set_remote_description(parse(offer)?).await.map_err(|e| anyhow!("{e}"))?;
         let answer = self.pc.create_answer(AnswerOptions::default()).await.map_err(|e| anyhow!("{e}"))?;
@@ -308,6 +346,8 @@ impl Call {
             .await
     }
 
+    /// Pulls one remote track (`track` of session `remote_session`).
+    /// `&mut self` because we record the new mid in `self.pulled`.
     async fn pull(&mut self, remote_session: &str, track: &str) -> Result<()> {
         let res = self
             .sfu
@@ -321,15 +361,15 @@ impl Call {
             .first()
             .and_then(|t| t.mid.clone())
             .ok_or_else(|| anyhow!("SFU track mid döndürmedi"))?;
-        // on_track tetiklenmeden önce sahibini kaydet. Müzik ayrı bir sahip anahtarı alır
-        // ("oturum#music"): konuşma halkasını yakmasın, ses ayarı ayrı olsun.
+        // Record the owner before `on_track` fires. Music gets its own owner key
+        // ("session#music"), so it doesn't light the speaking ring and its volume is separate.
         let owner = if track == "music" { music_owner(remote_session) } else { remote_session.to_string() };
         self.shared.mid_owner.lock().insert(mid.clone(), owner);
         if res.requires_immediate_renegotiation {
             if let Some(offer) = &res.session_description {
                 if let Err(e) = self.answer_offer(offer).await {
-                    // Yarım kalan çekme: SFU'da açık kalırsa sonraki denemeyle sesi iki kez duyarız.
-                    // Önce susturup kapatmayı dene; olmazsa sonra tekrar denenir.
+                    // Half-finished pull: if it stays open on the SFU, the next attempt would make
+                    // us hear this person twice. Mute and close it now; if closing fails it's retried later.
                     self.drop_mid(&mid).await;
                     return Err(e);
                 }
@@ -339,14 +379,15 @@ impl Call {
         Ok(())
     }
 
+    /// Stops pulling the track with key "sessionId/trackName".
     async fn unpull(&mut self, key: &str) -> Result<()> {
         let Some(mid) = self.pulled.remove(key) else { return Ok(()) };
         self.drop_mid(&mid).await;
         Ok(())
     }
 
-    /// Bir uzak track'i susturur, yerel kayıtlardan siler ve SFU'da kapatır.
-    /// Kapatılamazsa `zombies` listesine eklenir ve sonra yeniden denenir.
+    /// Mutes a remote track, removes it from our local bookkeeping and closes it on the SFU.
+    /// If closing fails it's added to `zombies` and retried during maintenance.
     async fn drop_mid(&mut self, mid: &str) {
         if let Some(t) = self.shared.audio_tracks.lock().remove(mid) {
             t.set_enabled(false);
@@ -363,6 +404,7 @@ impl Call {
         }
     }
 
+    /// Asks the SFU to close the track with this mid (and answers its renegotiation offer).
     async fn close_mid(&self, mid: &str) -> Result<()> {
         let res = self
             .sfu
@@ -376,8 +418,9 @@ impl Call {
         Ok(())
     }
 
-    /// Ses kanalındaki katılımcılara göre çekilen track'leri günceller.
-    /// `watch`: ekranını izlediğimiz kişinin oturum id'si.
+    /// Updates which tracks we pull so they match the voice channel's participants.
+    /// `watch`: session id of the person whose screen we're watching (screens are only
+    /// pulled while watched, to save bandwidth; mics and music are always pulled).
     pub async fn sync(&mut self, participants: &[Participant], watch: Option<&str>) {
         self.last_sync = (participants.to_vec(), watch.map(String::from));
         let mut desired: HashSet<(String, String)> = HashSet::new();
@@ -413,7 +456,7 @@ impl Call {
         }
     }
 
-    /// Bağlantı koptu mu (yeniden katılmak gerekir mi)?
+    /// Is the connection broken (do we need to rejoin)? "Disconnected" for > 8 s also counts.
     pub fn is_broken(&self) -> bool {
         match *self.shared.pc_state.lock() {
             Some((PeerConnectionState::Failed, _)) => true,
@@ -422,15 +465,15 @@ impl Call {
         }
     }
 
-    /// Düzenli bakım: takılmış ses track'lerini kapatıp yeniden çeker ve
-    /// daha önce çekilemeyen track'leri yeniden dener.
+    /// Periodic maintenance: closes and re-pulls stalled audio tracks and retries
+    /// tracks that couldn't be pulled before.
     pub async fn heal(&mut self) {
-        // Kapatılamamış track'leri yeniden kapatmayı dene.
+        // Retry closing tracks the SFU didn't close earlier.
         let zombies: Vec<String> = self.zombies.iter().cloned().collect();
         for mid in zombies {
             self.drop_mid(&mid).await;
         }
-        // Hiçbir çekmeye ait olmayan ses track'leri (sahipsiz kopyalar): sustur ve kapat.
+        // Audio tracks that belong to no current pull (orphaned duplicates): mute and close them.
         let live: HashSet<String> = self.pulled.values().cloned().collect();
         let orphans: Vec<String> =
             self.shared.audio_tracks.lock().keys().filter(|m| !live.contains(*m)).cloned().collect();
@@ -452,22 +495,26 @@ impl Call {
         self.sync(&participants, watch.as_deref()).await;
     }
 
+    /// Mute/unmute our microphone.
     pub fn set_muted(&self, muted: bool) {
         self.shared.muted.store(muted, Ordering::Relaxed);
         if muted {
             self.mic.set_enabled(false);
         }
-        // Açılış, hassasiyet döngüsünde ses eşiği geçince olur.
+        // Unmuting happens in the gate loop, once the level is above the threshold.
     }
 
+    /// Deafen = stop playing everyone else's audio.
     pub fn set_deafened(&self, deafened: bool) {
         self.shared.deafened.store(deafened, Ordering::Relaxed);
-        // Yalnızca takip edilen ses track'leri: susturulmuş kopyalar yeniden açılmasın.
+        // Only the tracked audio tracks: muted duplicates must not be re-enabled.
         for t in self.shared.audio_tracks.lock().values() {
             t.set_enabled(!deafened);
         }
     }
 
+    /// Starts sharing a screen or window. `source_id`/`kind` come from
+    /// `screen::list_sources`.
     pub async fn start_screen(&mut self, source_id: u64, kind: String) -> Result<()> {
         if self.screen.is_some() {
             self.stop_screen().await?;
@@ -493,21 +540,21 @@ impl Call {
         self.stop_local(transceiver, mid).await
     }
 
-    /// Bir uygulamanın sesini (pid) "music" track'i olarak yayınlar.
+    /// Publishes the audio of an app (process `pid`) as track "music".
     pub async fn start_music(&mut self, pid: u32) -> Result<()> {
         use crate::appaudio::{CHANNELS, SAMPLE_RATE};
         if self.music.is_some() {
             self.stop_music().await?;
         }
-        // Yakalanan ses tampona girer; 10 ms'lik dilimler düzenli olarak gönderilir.
-        // Uygulama sustuğunda (duraklatınca) sessizlik gönderilir, böylece yayın kesilmez.
+        // Captured audio goes into a buffer; a timer sends it on in 10 ms slices.
+        // When the app goes quiet (paused), silence is sent so the stream doesn't stall.
         let buf = Arc::new(Mutex::new(std::collections::VecDeque::<f32>::new()));
         let capture = {
             let buf = buf.clone();
             crate::appaudio::capture(pid, move |d| {
                 let mut b = buf.lock();
                 b.extend(d.iter().copied());
-                // En fazla 200 ms gecikme: fazlası atılır.
+                // At most 200 ms of delay: anything beyond that is dropped.
                 let max = (SAMPLE_RATE / 5 * CHANNELS) as usize;
                 if b.len() > max {
                     let extra = b.len() - max;
@@ -529,7 +576,7 @@ impl Call {
                 let chunk = (SAMPLE_RATE / 100 * CHANNELS) as usize;
                 let mut tick = tokio::time::interval(Duration::from_millis(10));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-                // Başta biraz biriktir (titremeye karşı).
+                // Collect a little first (protects against jitter).
                 let mut primed = false;
                 loop {
                     tick.tick().await;
@@ -590,7 +637,7 @@ impl Call {
         self.stop_local(transceiver, mid).await
     }
 
-    /// Yerel bir yayını durdurur ve SFU'da kapatır.
+    /// Stops a local stream and closes it on the SFU.
     async fn stop_local(&mut self, transceiver: RtpTransceiver, mid: String) -> Result<()> {
         transceiver.stop().map_err(|e| anyhow!("{e}"))?;
         let offer = self.pc.create_offer(offer_options()).await.map_err(|e| anyhow!("{e}"))?;
@@ -614,6 +661,8 @@ impl Call {
         Ok(())
     }
 
+    /// The track names we currently publish (sent to the server so others know
+    /// what to pull). `&'static str` = string literals that live forever.
     pub fn tracks(&self) -> Vec<&'static str> {
         let mut t = vec!["mic"];
         if self.screen.is_some() {
@@ -625,9 +674,12 @@ impl Call {
         t
     }
 
+    /// Leaves the voice channel. Takes `self` by value (not `&self`), so the `Call`
+    /// is consumed: after `leave()` the caller can't use it anymore — the compiler
+    /// enforces that.
     pub fn leave(mut self) {
         self.stats_task.abort();
-        self.screen = None; // yakalamayı durdurur
+        self.screen = None; // dropping the Capture stops screen capturing
         if let Some(m) = self.music.take() {
             m.pacer.abort();
         }
@@ -644,15 +696,17 @@ impl Call {
     }
 }
 
+/// Called by WebRTC (on its own thread) whenever a remote track starts arriving.
+/// Audio tracks are registered for volume control; video tracks get a viewer task.
 fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
     let mid = ev.transceiver.mid().unwrap_or_default();
     match ev.track {
         MediaStreamTrack::Audio(t) => {
-            // Ses, platform ADM üzerinden otomatik çalınır.
+            // Audio is played automatically through the platform ADM.
             if shared.deafened.load(Ordering::Relaxed) {
                 t.set_enabled(false);
             }
-            // Aynı kişiden önceden gelen ses varsa (kopya) sustur; bakım döngüsü kapatır.
+            // If audio from the same person already exists (a duplicate), mute it; maintenance closes it.
             let owners = shared.mid_owner.lock().clone();
             if let Some(owner) = owners.get(&mid) {
                 for (m, old) in shared.audio_tracks.lock().iter() {
@@ -662,7 +716,8 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
                     }
                 }
             }
-            // Yükseklik ayarı hassasiyet döngüsünde uygulanır (WebRTC iş parçacığını bekletmemek için).
+            // Volume is applied by the stats loop (so we don't block WebRTC's thread
+            // here with a call that waits on another WebRTC thread).
             shared.audio_tracks.lock().insert(mid, t);
         }
         MediaStreamTrack::Video(t) => {
@@ -676,7 +731,7 @@ fn on_track(shared: &Arc<Shared>, ev: TrackEvent) {
     }
 }
 
-/// Uzak ekran görüntüsünü RGBA'ya çevirip arayüze bırakır.
+/// Converts the remote screen's frames to RGBA and hands them to the UI.
 async fn view_screen(shared: Arc<Shared>, owner: String, track: RtcVideoTrack) {
     let mut stream = NativeVideoStream::new(track);
     let min_gap = Duration::from_millis(1000 / VIEW_FPS);
@@ -693,6 +748,7 @@ async fn view_screen(shared: Arc<Shared>, owner: String, track: RtcVideoTrack) {
     }
 }
 
+/// Logs the audio devices WebRTC sees (helps debugging on friends' machines).
 fn log_devices(factory: &PeerConnectionFactory) {
     let rec: Vec<String> = (0..factory.recording_devices().max(0) as u16).map(|i| factory.recording_device_name(i)).collect();
     let play: Vec<String> = (0..factory.playout_devices().max(0) as u16).map(|i| factory.playout_device_name(i)).collect();
@@ -705,24 +761,27 @@ fn log_devices(factory: &PeerConnectionFactory) {
     );
 }
 
-/// Her 50 ms'de ses seviyelerini ölçer:
-/// - "kim konuşuyor" bilgisini arayüze verir,
-/// - giriş hassasiyetine göre mikrofonu açıp kapatır,
-/// - kişilere özel ses yüksekliklerini uygular.
-/// Ayrıca birkaç saniyede bir gönderilen/alınan ses miktarını log'a yazar.
+/// Runs every 50 ms:
+/// - measures audio levels ("who is speaking") for the UI,
+/// - opens/closes our microphone according to the input sensitivity,
+/// - applies per-user volumes,
+/// - detects stalled incoming audio.
+/// Every few seconds it also logs how much audio was sent/received.
 async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate::meter::Meter>, shared: Arc<Shared>) {
     use libwebrtc::stats::RtcStats;
     let mut tick: u32 = 0;
     let mut open_until: Option<Instant> = None;
     let mut mic_on = false;
-    // Otomatik mod: arka plan gürültüsü tahmini (dB).
+    // Automatic mode: estimate of the background noise level (dB).
     let mut noise_db: f32 = -60.0;
     let mut applied: HashMap<String, f32> = HashMap::new();
-    // mid -> (alınan bayt, son değişim anı)
+    // mid -> (bytes received, when that number last changed)
     let mut inbound: HashMap<String, (u64, Instant)> = HashMap::new();
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         tick += 1;
+        // WebRTC statistics: a list of entries of different kinds (one enum variant
+        // per kind). We pick out the ones we need with `match`.
         let Ok(stats) = pc.get_stats().await else { continue };
 
         let mut me = 0.0f64;
@@ -731,14 +790,15 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
         let mut peers = serde_json::Map::new();
         let mut recv = serde_json::Map::new();
         let owners = shared.mid_owner.lock().clone();
-        // Çekilen her ses track'i için alınan bayt (hiç istatistiği yoksa 0).
+        // Bytes received for every pulled audio track (0 if it has no statistics yet).
         let mut bytes_now: HashMap<String, u64> =
             shared.audio_tracks.lock().keys().map(|m| (m.clone(), 0)).collect();
         for st in &stats {
             match st {
                 RtcStats::MediaSource(m) if m.source.kind == "audio" => me = me.max(m.audio.audio_level),
                 RtcStats::OutboundRtp(o) if o.stream.kind == "audio" => sent += o.sent.bytes_sent,
-                // Seçili bağlantı çiftinin gidiş-dönüş süresi (ICE bağlantı kontrollerinden; ek trafik yok).
+                // Round-trip time of the selected connection pair (measured from ICE
+                // connectivity checks; no extra traffic).
                 RtcStats::CandidatePair(c) if c.candidate_pair.nominated && c.candidate_pair.current_round_trip_time > 0.0 => {
                     rtt = Some(c.candidate_pair.current_round_trip_time * 1000.0);
                 }
@@ -752,7 +812,7 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
                 _ => {}
             }
         }
-        // Takılan ses: 6 saniyedir hiç yeni veri gelmiyorsa yeniden çekilsin.
+        // Stalled audio: if no new data arrived for 6 seconds, re-pull the track.
         {
             let now = Instant::now();
             inbound.retain(|mid, _| bytes_now.contains_key(mid));
@@ -770,35 +830,35 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
             log::info!("ses: mikrofon seviyesi {me:.3}, açık {mic_on}, gönderilen {sent} B, alınan {recv:?}, seviyeler {peers:?}");
         }
 
-        // Giriş hassasiyeti
-        // Seviye ayrı ölçerden gelir; WebRTC'nin değeri track kapalıyken 0 olur.
+        // Input sensitivity (voice gate)
+        // The level comes from the separate meter; WebRTC's value is 0 while the track is off.
         let level = meter.as_ref().map(|m| m.take_level()).unwrap_or(me as f32);
         let db = level_db(level);
         if tick % 100 == 0 {
             log::info!("ses: ölçer seviyesi {level:.3} ({db:.0} dB)");
         }
         let gate = *shared.gate.lock();
-        // Gürültü tabanı: aşağı hızlı, yukarı yavaş iner/çıkar (konuşma tabanı yükseltmesin).
-        // Gürültü tabanı: aşağı hızlı iner; yukarı yalnızca konuşulmuyorken (eşik kapalıyken)
-        // ve çok yavaş çıkar. Böylece uzun konuşmalar "gürültü" sanılıp eşiği yükseltmez.
+        // Noise floor: follows quiet levels down quickly; rises only very slowly, and
+        // even more slowly while we're talking. So long speech isn't mistaken for
+        // "noise" that would push the threshold up.
         let speaking_now = open_until.is_some_and(|t| Instant::now() < t);
         if tick <= 20 {
-            // İlk saniye: odanın gürültüsünü doğrudan ölç (en düşük seviye).
+            // First second: measure the room's noise directly (lowest level seen).
             noise_db = if tick == 1 { db } else { noise_db.min(db) };
         } else if db < noise_db {
             noise_db += (db - noise_db) * 0.3;
         } else {
-            // Sessizken ~25 sn'de, konuşurken ~2 dk'da uyum sağlar.
+            // Adapts in ~25 s while quiet, ~2 min while talking.
             noise_db += (db - noise_db) * if speaking_now { 0.0004 } else { 0.002 };
         }
-        // Konuşma neredeyse her zaman -35 dB'nin üstündedir; eşik bunu geçmesin.
+        // Speech is almost always above -35 dB; never let the threshold go higher.
         let auto_threshold = (noise_db + 12.0).clamp(-60.0, -38.0);
         let threshold = if gate.auto { auto_threshold } else { gate.threshold_db };
         let now = Instant::now();
         if db >= threshold {
             open_until = Some(now + GATE_HOLD);
         }
-        // Ölçer yoksa eşik uygulanmaz: mikrofon hep açık.
+        // Without a meter there's no gate: the mic is always on.
         let open = meter.is_none() || open_until.is_some_and(|t| now < t);
         let want = open && !shared.muted.load(Ordering::Relaxed);
         if want != mic_on {
@@ -806,7 +866,7 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
             mic_on = want;
         }
 
-        // Kişilere özel ses yüksekliği
+        // Per-user volume
         {
             let volumes = shared.volumes.lock().clone();
             let tracks: Vec<(String, RtcAudioTrack)> =
