@@ -108,7 +108,12 @@ fn main() -> eframe::Result {
         viewport = viewport.with_decorations(false);
     }
     // `..Default::default()` = "all other fields take their default values".
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // Which GPU backend draws the UI. On Windows we use glow (OpenGL): the default
+    // wgpu renderer goes through DirectX 12, whose driver allocations show up as
+    // tens of MB of extra RAM for our process. Other systems keep wgpu.
+    // `cfg!(...)` is a compile-time true/false, so this is decided per build target.
+    let renderer = if cfg!(windows) { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu };
+    let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
 
     // Make the tokio runtime "current" for this thread, so code running on the UI
     // thread can call `tokio::spawn` too. The guard undoes it when dropped (at the
