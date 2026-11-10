@@ -145,6 +145,25 @@ impl Drop for Capture {
     }
 }
 
+/// Windows: the process id of the app that owns a window. For window capture,
+/// WebRTC's source id *is* the window handle (HWND), so we can ask Windows who
+/// owns it. Used to share that app's sound along with its window.
+#[cfg(windows)]
+pub fn window_pid(source_id: u64) -> Option<u32> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mut pid = 0u32;
+    // `unsafe`: a Windows API call. A stale handle just gives pid 0 (no crash).
+    unsafe { GetWindowThreadProcessId(HWND(source_id as isize), Some(&mut pid)) };
+    (pid != 0).then_some(pid)
+}
+
+/// Other systems: no per-app audio capture, so there's nothing to look up.
+#[cfg(not(windows))]
+pub fn window_pid(_source_id: u64) -> Option<u32> {
+    None
+}
+
 /// Converts one captured frame to I420, scales it down if needed and hands it
 /// to WebRTC.
 fn push_frame(video: &NativeVideoSource, frame: &DesktopFrame, start: Instant) {

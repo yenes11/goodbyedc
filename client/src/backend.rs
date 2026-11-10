@@ -440,7 +440,7 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
             }
             VoiceCmd::MusicStart { pid } => {
                 let Some(c) = call.as_mut() else { continue };
-                if let Err(e) = c.start_music(pid).await {
+                if let Err(e) = c.start_music(crate::appaudio::Target::App(pid)).await {
                     sink.toast(format!("Ses paylaşılamadı: {e:#}"), true);
                 }
                 sink.send(Event::Tracks(c.tracks().into_iter().map(String::from).collect()));

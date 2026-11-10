@@ -221,12 +221,16 @@ async fn process(
     // Current gate gain 0..1, moved gradually towards 0 or 1 (the fade).
     let mut gain: f32 = 0.0;
     let mut cleaned = vec![0.0f32; FRAME];
+    // When the last microphone data arrived (to tell "mic is dead" from "late").
+    let mut last_data = std::time::Instant::now();
 
     loop {
         // Wait for the next message, but at most 50 ms. `timeout` returns
-        // `Err(_)` when the time is up; then we send silence instead, so our
-        // outgoing audio never stops completely while the mic is being reopened
-        // (a stream with no packets looks "stalled" to the others).
+        // `Err(_)` when the time is up. If the mic has been silent for a while
+        // (it's being reopened), we send silence so our outgoing audio never
+        // stops completely (a stream with no packets looks "stalled" to the
+        // others). A merely *late* chunk (busy computer, e.g. while screen
+        // sharing) must not get silence inserted: that was audible as dropouts.
         match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
             // Sender gone: the microphone thread ended (call is closing).
             Ok(None) => break,
@@ -235,8 +239,21 @@ async fn process(
                 resampler = Resampler::new(r);
                 continue;
             }
-            Ok(Some(Msg::Data(chunk))) => resampler.push(&chunk, &mut pending),
-            Err(_) => pending.extend(std::iter::repeat(0.0).take(FRAME * 5)),
+            Ok(Some(Msg::Data(chunk))) => {
+                last_data = std::time::Instant::now();
+                resampler.push(&chunk, &mut pending);
+                // If we ever fall behind, don't let the delay grow: keep at most
+                // 60 ms of unprocessed audio and drop the oldest beyond that.
+                let max = FRAME * 6;
+                if pending.len() > max {
+                    let extra = pending.len() - max;
+                    pending.drain(..extra);
+                }
+            }
+            Err(_) if last_data.elapsed() > Duration::from_millis(300) => {
+                pending.extend(std::iter::repeat(0.0).take(FRAME * 5));
+            }
+            Err(_) => continue,
         }
         while pending.len() >= FRAME {
             // RNNoise expects samples in 16-bit range (-32768..32767), not -1..1.

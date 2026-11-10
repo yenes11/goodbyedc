@@ -52,7 +52,20 @@ pub fn list() -> Vec<AppAudio> {
     Vec::new()
 }
 
-/// Captures the audio of process `pid` and hands 48 kHz stereo 32-bit float
+/// Whose audio to capture.
+#[derive(Clone, Copy, Debug)]
+// Outside Windows the pid inside `App` is never read; silence that warning there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum Target {
+    /// One app (process id), including the processes it started.
+    App(u32),
+    /// Everything playing on the computer *except* goodbyedc itself. Used when a
+    /// whole screen is shared: the others hear the game/video, but not their own
+    /// voices coming back from our speakers.
+    AllButUs,
+}
+
+/// Captures the audio of `target` and hands 48 kHz stereo 32-bit float
 /// samples (-1..1, interleaved) to `on_data`. Float is used so that quiet audio
 /// that gets boosted later (normalize.rs) doesn't lose resolution.
 ///
@@ -61,19 +74,19 @@ pub fn list() -> Vec<AppAudio> {
 ///   - can be sent to another thread (Send),
 ///   - doesn't borrow short-lived data ('static)".
 /// It will be called on the capture thread.
-pub fn capture(pid: u32, on_data: impl FnMut(&[f32]) + Send + 'static) -> anyhow::Result<Capture> {
+pub fn capture(target: Target, on_data: impl FnMut(&[f32]) + Send + 'static) -> anyhow::Result<Capture> {
     let stop = Arc::new(AtomicBool::new(false));
     // Only one of these two blocks exists in the compiled program, and it is the
     // last expression of the function, so its value is what `capture` returns.
     #[cfg(windows)]
     {
-        imp::start(pid, stop.clone(), on_data)?;
+        imp::start(target, stop.clone(), on_data)?;
         Ok(Capture { stop })
     }
     #[cfg(not(windows))]
     {
         // Mark the parameters as used to avoid "unused variable" warnings.
-        let _ = (pid, on_data, stop);
+        let _ = (target, on_data, stop);
         anyhow::bail!("Uygulama sesi paylaşımı şimdilik yalnızca Windows'ta çalışıyor")
     }
 }
@@ -196,16 +209,16 @@ mod imp {
     // IAgileObject has no methods; an empty impl is enough.
     impl IAgileObject_Impl for Handler {}
 
-    /// Starts a capture thread for `pid`. Returns once capturing is running (or
+    /// Starts a capture thread for `target`. Returns once capturing is running (or
     /// with the error that prevented it).
     pub fn start(
-        pid: u32,
+        target: super::Target,
         stop: Arc<AtomicBool>,
         mut on_data: impl FnMut(&[f32]) + Send + 'static,
     ) -> anyhow::Result<()> {
         let (ready_tx, ready_rx) = mpsc::channel::<anyhow::Result<()>>();
         std::thread::Builder::new().name("uygulama-sesi".into()).spawn(move || unsafe {
-            let client = match open(pid) {
+            let client = match open(target) {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -255,19 +268,24 @@ mod imp {
         ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| anyhow!("ses yakalama yanıt vermedi"))?
     }
 
-    /// Opens a process-loopback audio client for `pid`.
+    /// Opens a process-loopback audio client for `target`.
     /// Returns the audio client, the capture interface and the "data ready" event.
     unsafe fn open(
-        pid: u32,
+        target: super::Target,
     ) -> anyhow::Result<(IAudioClient, IAudioCaptureClient, windows::Win32::Foundation::HANDLE)> {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        // "Capture the audio of this process and its children."
+        // App: "capture the audio of this process and its children".
+        // AllButUs: "capture everything *except* our own process (and children)".
+        let (pid, mode) = match target {
+            super::Target::App(pid) => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
+            super::Target::AllButUs => (std::process::id(), PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
+        };
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
                 ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                     TargetProcessId: pid,
-                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                    ProcessLoopbackMode: mode,
                 },
             },
         };

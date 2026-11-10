@@ -197,6 +197,9 @@ pub struct Call {
     _mic_proc: Option<crate::micproc::MicPipeline>,
     screen: Option<LocalScreen>,
     music: Option<LocalMusic>,
+    /// Was the current "music" track started automatically by screen sharing?
+    /// (Then stopping the screen share stops it too.)
+    music_from_screen: bool,
     /// "sessionId/trackName" -> mid of every track we currently pull.
     pulled: HashMap<String, String>,
     /// Last known participants and watched screen (to retry failed pulls later).
@@ -331,6 +334,7 @@ impl Call {
             _mic_proc: mic_proc,
             screen: None,
             music: None,
+            music_from_screen: false,
             pulled: HashMap::new(),
             last_sync: (Vec::new(), None),
             repulled: HashMap::new(),
@@ -339,7 +343,10 @@ impl Call {
             stats_task,
         };
         // Publish our microphone to the SFU as track "mic".
-        let tr = call.add_send_transceiver(MediaStreamTrack::Audio(mic), vec![])?;
+        // Priority High: when the upload is tight (e.g. during screen sharing),
+        // WebRTC gives the voice its bandwidth first and squeezes the video instead.
+        let mic_enc = RtpEncodingParameters { priority: Priority::High, ..Default::default() };
+        let tr = call.add_send_transceiver(MediaStreamTrack::Audio(mic), vec![mic_enc])?;
         call.push_track(&tr, "mic").await.context("mikrofon gönderilemedi")?;
         Ok(call)
     }
@@ -565,16 +572,38 @@ impl Call {
             self.stop_screen().await?;
         }
         let video = NativeVideoSource::new(VideoResolution { width: 1920, height: 1080 }, true);
-        let capture = Capture::start(source_id, kind, video.clone())?;
+        let capture = Capture::start(source_id, kind.clone(), video.clone())?;
         let track = self.factory.create_video_track("screen", video);
         let enc = RtpEncodingParameters {
-            max_bitrate: Some(3_000_000),
+            // 2.5 Mbps at most (was 3): many home connections upload only a few
+            // Mbps, and a saturated upload made our voice break up while sharing.
+            max_bitrate: Some(2_500_000),
             max_framerate: Some(screen::FPS as f64),
+            // Lower priority than the voice (see the mic's `Priority::High`).
+            priority: Priority::Low,
             ..Default::default()
         };
         let tr = self.add_send_transceiver(MediaStreamTrack::Video(track), vec![enc])?;
         let mid = self.push_track(&tr, "screen").await.context("ekran gönderilemedi")?;
         self.screen = Some(LocalScreen { _capture: capture, transceiver: tr, mid });
+
+        // Share the sound too (Windows only), unless app audio is already being
+        // shared by hand: a window -> that app's audio; a whole screen ->
+        // everything except goodbyedc (so nobody hears their own voice back).
+        // Failing here isn't fatal: the picture is already being shared.
+        if crate::appaudio::supported() && self.music.is_none() {
+            let target = if kind == "window" {
+                screen::window_pid(source_id).map(crate::appaudio::Target::App)
+            } else {
+                Some(crate::appaudio::Target::AllButUs)
+            };
+            if let Some(target) = target {
+                match self.start_music(target).await {
+                    Ok(()) => self.music_from_screen = true,
+                    Err(e) => log::warn!("ekran sesi paylaşılamadı: {e:#}"),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -582,11 +611,15 @@ impl Call {
         let Some(s) = self.screen.take() else { return Ok(()) };
         let LocalScreen { _capture, transceiver, mid } = s;
         drop(_capture);
+        // Stop the sound that came with the screen share (not hand-started audio).
+        if self.music_from_screen {
+            let _ = self.stop_music().await;
+        }
         self.stop_local(transceiver, mid).await
     }
 
-    /// Publishes the audio of an app (process `pid`) as track "music".
-    pub async fn start_music(&mut self, pid: u32) -> Result<()> {
+    /// Publishes the audio of `target` (one app, or everything but us) as track "music".
+    pub async fn start_music(&mut self, target: crate::appaudio::Target) -> Result<()> {
         use crate::appaudio::{CHANNELS, SAMPLE_RATE};
         if self.music.is_some() {
             self.stop_music().await?;
@@ -596,7 +629,7 @@ impl Call {
         let buf = Arc::new(Mutex::new(std::collections::VecDeque::<f32>::new()));
         let capture = {
             let buf = buf.clone();
-            crate::appaudio::capture(pid, move |d| {
+            crate::appaudio::capture(target, move |d| {
                 let mut b = buf.lock();
                 b.extend(d.iter().copied());
                 // At most 200 ms of delay: anything beyond that is dropped.
@@ -675,6 +708,7 @@ impl Call {
     }
 
     pub async fn stop_music(&mut self) -> Result<()> {
+        self.music_from_screen = false;
         let Some(m) = self.music.take() else { return Ok(()) };
         let LocalMusic { _capture, pacer, transceiver, mid } = m;
         drop(_capture);
