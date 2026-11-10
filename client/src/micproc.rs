@@ -98,6 +98,19 @@ impl Drop for MicPipeline {
     }
 }
 
+/// Messages from the microphone thread to the processing task.
+enum Msg {
+    /// The device was (re)opened with this sample rate.
+    Rate(u32),
+    /// A chunk of mono samples at the current device rate.
+    Data(Vec<f32>),
+}
+
+/// If the microphone delivers nothing for this long, the stream is considered
+/// dead (unplugged device, Bluetooth headset switching mode, Windows audio
+/// service restart...) and is reopened.
+const DEAD_AFTER: Duration = Duration::from_secs(2);
+
 impl MicPipeline {
     /// Opens the default microphone and starts feeding processed audio into
     /// `source` (a 48 kHz mono `NativeAudioSource`). Returns `None` if the
@@ -106,58 +119,96 @@ impl MicPipeline {
     /// Must be called from inside the tokio runtime (it spawns a task).
     pub fn start(source: NativeAudioSource, shared: Arc<Shared>) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        // The cpal callback sends raw mono chunks (with the device's sample rate)
-        // through this channel. An *unbounded* channel never blocks the sender,
-        // which matters because the callback runs on a real-time audio thread.
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<f32>>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<u32>>();
+        // The cpal callback sends raw mono chunks through this channel. An
+        // *unbounded* channel never blocks the sender, which matters because the
+        // callback runs on a real-time audio thread.
+        let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
         {
             let stop = stop.clone();
             // cpal streams may not be movable between threads on every platform,
             // so the stream is opened, kept and closed on one dedicated thread.
             std::thread::Builder::new()
                 .name("mikrofon".into())
-                .spawn(move || {
-                    let (stream, rate) = match open(tx) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            log::warn!("mikrofon açılamadı: {e:#}");
-                            let _ = ready_tx.send(None);
-                            return;
-                        }
-                    };
-                    let _ = ready_tx.send(Some(rate));
-                    while !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    drop(stream);
-                    log::info!("mikrofon kapandı");
-                })
+                .spawn(move || mic_thread(tx, ready_tx, stop))
                 .ok()?;
         }
-        // Wait (max 5 s) for the thread to report the device's sample rate.
-        let rate = match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Some(r)) => r,
-            _ => {
-                stop.store(true, Ordering::Relaxed);
-                return None;
-            }
-        };
+        // Wait (max 5 s) for the first successful open.
+        if ready_rx.recv_timeout(Duration::from_secs(5)) != Ok(true) {
+            stop.store(true, Ordering::Relaxed);
+            return None;
+        }
         let state = Arc::new(MicState::default());
-        let task = tokio::spawn(process(rx, rate, source, shared, state.clone()));
+        let task = tokio::spawn(process(rx, source, shared, state.clone()));
         Some(Self { state, stop, task })
     }
 }
 
+/// Body of the microphone thread: opens the stream and keeps it alive, and
+/// reopens it whenever it dies (error reported by cpal, or no data for
+/// `DEAD_AFTER`). Before this watchdog, a stream that silently stopped meant the
+/// others stopped hearing us until we left and rejoined the channel.
+fn mic_thread(tx: mpsc::UnboundedSender<Msg>, ready_tx: std::sync::mpsc::Sender<bool>, stop: Arc<AtomicBool>) {
+    let mut first = true;
+    while !stop.load(Ordering::Relaxed) {
+        // `alive` counts callbacks (the watchdog checks that it keeps moving);
+        // `failed` is set by cpal's error callback.
+        let alive = Arc::new(AtomicU32::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        match open(tx.clone(), alive.clone(), failed.clone()) {
+            Ok((stream, rate)) => {
+                let _ = tx.send(Msg::Rate(rate));
+                if first {
+                    let _ = ready_tx.send(true);
+                    first = false;
+                }
+                let mut last_count = 0;
+                let mut last_change = std::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let count = alive.load(Ordering::Relaxed);
+                    if count != last_count {
+                        last_count = count;
+                        last_change = std::time::Instant::now();
+                    }
+                    if failed.load(Ordering::Relaxed) {
+                        log::warn!("mikrofon akışı hata verdi, yeniden açılıyor");
+                        break;
+                    }
+                    if last_change.elapsed() > DEAD_AFTER {
+                        log::warn!("mikrofondan {DEAD_AFTER:?} veri gelmedi, yeniden açılıyor");
+                        break;
+                    }
+                }
+                drop(stream);
+            }
+            Err(e) => {
+                log::warn!("mikrofon açılamadı: {e:#}");
+                if first {
+                    // The very first open failed: report it so the call falls
+                    // back to WebRTC's own capture.
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            }
+        }
+        // Short pause before retrying, so a missing device doesn't spin the CPU.
+        if !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    log::info!("mikrofon kapandı");
+}
+
 /// The processing loop: runs for as long as the call lasts.
 async fn process(
-    mut rx: mpsc::UnboundedReceiver<Vec<f32>>,
-    device_rate: u32,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
     source: NativeAudioSource,
     shared: Arc<Shared>,
     state: Arc<MicState>,
 ) {
-    let mut resampler = Resampler::new(device_rate);
+    // Replaced as soon as the first `Msg::Rate` arrives.
+    let mut resampler = Resampler::new(RATE);
     // 48 kHz samples waiting to fill a whole 10 ms frame.
     let mut pending: Vec<f32> = Vec::with_capacity(FRAME * 4);
     // RNNoise keeps internal state between frames (it "listens" over time), so one
@@ -171,10 +222,22 @@ async fn process(
     let mut gain: f32 = 0.0;
     let mut cleaned = vec![0.0f32; FRAME];
 
-    // `recv().await` sleeps until the next chunk arrives; `None` = sender gone
-    // (microphone closed), which ends the loop.
-    while let Some(chunk) = rx.recv().await {
-        resampler.push(&chunk, &mut pending);
+    loop {
+        // Wait for the next message, but at most 50 ms. `timeout` returns
+        // `Err(_)` when the time is up; then we send silence instead, so our
+        // outgoing audio never stops completely while the mic is being reopened
+        // (a stream with no packets looks "stalled" to the others).
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            // Sender gone: the microphone thread ended (call is closing).
+            Ok(None) => break,
+            Ok(Some(Msg::Rate(r))) => {
+                log::info!("mikrofon hızı: {r} Hz");
+                resampler = Resampler::new(r);
+                continue;
+            }
+            Ok(Some(Msg::Data(chunk))) => resampler.push(&chunk, &mut pending),
+            Err(_) => pending.extend(std::iter::repeat(0.0).take(FRAME * 5)),
+        }
         while pending.len() >= FRAME {
             // RNNoise expects samples in 16-bit range (-32768..32767), not -1..1.
             let input: Vec<f32> = pending.drain(..FRAME).map(|s| s * 32767.0).collect();
@@ -265,7 +328,11 @@ impl Resampler {
 
 /// Opens the default input device. Returns the stream and its sample rate.
 /// Every callback downmixes to mono -1..1 floats and sends the chunk to `tx`.
-fn open(tx: mpsc::UnboundedSender<Vec<f32>>) -> anyhow::Result<(cpal::Stream, u32)> {
+fn open(
+    tx: mpsc::UnboundedSender<Msg>,
+    alive: Arc<AtomicU32>,
+    failed: Arc<AtomicBool>,
+) -> anyhow::Result<(cpal::Stream, u32)> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or_else(|| anyhow::anyhow!("mikrofon yok"))?;
     let config = device.default_input_config()?;
@@ -275,12 +342,18 @@ fn open(tx: mpsc::UnboundedSender<Vec<f32>>) -> anyhow::Result<(cpal::Stream, u3
     let fmt = config.sample_format();
     let cfg: cpal::StreamConfig = config.into();
     let stream = match fmt {
-        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, channels, tx)?,
-        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, channels, tx)?,
-        cpal::SampleFormat::I32 => build::<i32>(&device, &cfg, channels, tx)?,
-        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, channels, tx)?,
+        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, channels, tx, alive, failed)?,
+        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, channels, tx, alive, failed)?,
+        cpal::SampleFormat::I32 => build::<i32>(&device, &cfg, channels, tx, alive, failed)?,
+        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, channels, tx, alive, failed)?,
         other => anyhow::bail!("desteklenmeyen örnek biçimi: {other:?}"),
     };
+    // Windows: opening a microphone counts as "communications activity", and
+    // Windows then lowers every other app's volume ("ducking"). The opt-out has
+    // to be in place when the stream *starts*, so it's applied right here: the
+    // stream (and its audio session) exists now, but isn't running yet.
+    // On other systems `disable` does nothing.
+    crate::ducking::disable();
     stream.play()?;
     Ok((stream, rate))
 }
@@ -295,7 +368,9 @@ fn build<T>(
     device: &cpal::Device,
     cfg: &cpal::StreamConfig,
     channels: usize,
-    tx: mpsc::UnboundedSender<Vec<f32>>,
+    tx: mpsc::UnboundedSender<Msg>,
+    alive: Arc<AtomicU32>,
+    failed: Arc<AtomicBool>,
 ) -> anyhow::Result<cpal::Stream>
 where
     T: SizedSample,
@@ -311,9 +386,14 @@ where
                 .chunks(channels)
                 .map(|c| c.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / c.len() as f32)
                 .collect();
-            let _ = tx.send(mono);
+            let _ = tx.send(Msg::Data(mono));
+            // `wrapping_add` = add, starting again from 0 instead of overflowing.
+            alive.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.wrapping_add(1))).ok();
         },
-        |e| log::warn!("mikrofon hatası: {e}"),
+        move |e| {
+            log::warn!("mikrofon hatası: {e}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )?;
     Ok(stream)
