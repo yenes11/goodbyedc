@@ -191,6 +191,10 @@ pub struct Call {
     pc: PeerConnection,
     pub session_id: String,
     mic: RtcAudioTrack,
+    /// Our own mic pipeline (capture → RNNoise → gate). `None` = fallback to
+    /// WebRTC's own capture. Kept here so it lives (and the mic stays open) for
+    /// the whole call; dropping the `Call` drops it and closes the microphone.
+    _mic_proc: Option<crate::micproc::MicPipeline>,
     screen: Option<LocalScreen>,
     music: Option<LocalMusic>,
     /// "sessionId/trackName" -> mid of every track we currently pull.
@@ -259,31 +263,66 @@ impl Call {
         if !factory.acquire_platform_adm() {
             return Err(anyhow!("Ses aygıtı başlatılamadı"));
         }
-        factory.set_adm_recording_enabled(true);
+        shared.muted.store(muted, Ordering::Relaxed);
+
+        // Preferred path: capture the mic ourselves and clean it with RNNoise
+        // (see micproc.rs). The processed audio goes into this source: 48 kHz,
+        // mono, queue 0 = frames are handed to WebRTC as soon as we produce them.
+        // WebRTC's own processing is off for it (RNNoise does the cleaning).
+        let mic_source = NativeAudioSource::new(
+            AudioSourceOptions { echo_cancellation: false, noise_suppression: false, auto_gain_control: false },
+            crate::micproc::RATE,
+            1,
+            0,
+        );
+        // `start` waits for the device to open, so run it on the blocking pool.
+        let mic_proc = {
+            let (src, sh) = (mic_source.clone(), shared.clone());
+            tokio::task::spawn_blocking(move || crate::micproc::MicPipeline::start(src, sh))
+                .await
+                .ok()
+                .flatten()
+        };
+        // WebRTC records the microphone only in the fallback case; otherwise the
+        // mic would be opened twice. Playout (hearing others) always goes through it.
+        factory.set_adm_recording_enabled(mic_proc.is_none());
         factory.set_adm_playout_enabled(true);
         let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
         log_devices(&factory);
 
         let session_id = sfu.new_session().await?;
-        let mic = factory.create_device_audio_track("mic");
-        shared.muted.store(muted, Ordering::Relaxed);
-        // The gate in `stats_loop` opens it once the level is above the threshold.
+        let mic = if mic_proc.is_some() {
+            log::info!("mikrofon: RNNoise hattı kullanılıyor");
+            factory.create_audio_track("mic", mic_source)
+        } else {
+            log::warn!("mikrofon: RNNoise hattı açılamadı, WebRTC yakalamasına dönülüyor");
+            factory.create_device_audio_track("mic")
+        };
+        // `stats_loop` enables the track (immediately with our pipeline, which
+        // gates by itself; in the fallback once the level crosses the threshold).
         mic.set_enabled(false);
 
-        // Measure the mic level separately (WebRTC doesn't measure while the track is
-        // disabled). `spawn_blocking` runs the blocking `Meter::start` on a thread meant
-        // for blocking work, so it doesn't stall the async runtime.
-        let meter = tokio::task::spawn_blocking(crate::meter::Meter::start).await.ok().flatten();
-        if meter.is_none() {
-            log::warn!("mikrofon ölçer yok: giriş hassasiyeti devre dışı, mikrofon hep açık");
-        }
-        let stats_task = spawn(stats_loop(pc.clone(), mic.clone(), meter, shared.clone()));
+        // Fallback only: measure the mic level separately (WebRTC doesn't measure
+        // while the track is disabled). `spawn_blocking` runs the blocking
+        // `Meter::start` on a thread meant for blocking work.
+        let meter = if mic_proc.is_none() {
+            let m = tokio::task::spawn_blocking(crate::meter::Meter::start).await.ok().flatten();
+            if m.is_none() {
+                log::warn!("mikrofon ölçer yok: giriş hassasiyeti devre dışı, mikrofon hep açık");
+            }
+            m
+        } else {
+            None
+        };
+        let proc_state = mic_proc.as_ref().map(|p| p.state.clone());
+        let stats_task = spawn(stats_loop(pc.clone(), mic.clone(), meter, proc_state, shared.clone()));
         let call = Self {
             sfu,
             factory,
             pc,
             session_id,
             mic: mic.clone(),
+            _mic_proc: mic_proc,
             screen: None,
             music: None,
             pulled: HashMap::new(),
@@ -767,7 +806,17 @@ fn log_devices(factory: &PeerConnectionFactory) {
 /// - applies per-user volumes,
 /// - detects stalled incoming audio.
 /// Every few seconds it also logs how much audio was sent/received.
-async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate::meter::Meter>, shared: Arc<Shared>) {
+///
+/// `proc_state` is set when our own mic pipeline (micproc.rs) runs: it does the
+/// gating itself, so here we only follow mute and read its level/state. Otherwise
+/// (fallback) the gate below switches WebRTC's track on/off using `meter`.
+async fn stats_loop(
+    pc: PeerConnection,
+    mic: RtcAudioTrack,
+    meter: Option<crate::meter::Meter>,
+    proc_state: Option<Arc<crate::micproc::MicState>>,
+    shared: Arc<Shared>,
+) {
     use libwebrtc::stats::RtcStats;
     let mut tick: u32 = 0;
     let mut open_until: Option<Instant> = None;
@@ -831,40 +880,53 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
         }
 
         // Input sensitivity (voice gate)
-        // The level comes from the separate meter; WebRTC's value is 0 while the track is off.
-        let level = meter.as_ref().map(|m| m.take_level()).unwrap_or(me as f32);
-        let db = level_db(level);
-        if tick % 100 == 0 {
-            log::info!("ses: ölçer seviyesi {level:.3} ({db:.0} dB)");
-        }
-        let gate = *shared.gate.lock();
-        // Noise floor: follows quiet levels down quickly; rises only very slowly, and
-        // even more slowly while we're talking. So long speech isn't mistaken for
-        // "noise" that would push the threshold up.
-        let speaking_now = open_until.is_some_and(|t| Instant::now() < t);
-        if tick <= 20 {
-            // First second: measure the room's noise directly (lowest level seen).
-            noise_db = if tick == 1 { db } else { noise_db.min(db) };
-        } else if db < noise_db {
-            noise_db += (db - noise_db) * 0.3;
+        // `(a, b, c) = if ... { ... } else { ... }` computes three values at once
+        // (a tuple), depending on which mic path is active.
+        let (level, transmitting, auto_threshold) = if let Some(ps) = &proc_state {
+            // Our pipeline gates by itself (with pre-roll); the track only follows mute.
+            let want = !shared.muted.load(Ordering::Relaxed);
+            if want != mic_on {
+                mic.set_enabled(want);
+                mic_on = want;
+            }
+            (ps.take_level(), ps.open.load(Ordering::Relaxed), crate::micproc::AUTO_FLOOR_DB)
         } else {
-            // Adapts in ~25 s while quiet, ~2 min while talking.
-            noise_db += (db - noise_db) * if speaking_now { 0.0004 } else { 0.002 };
-        }
-        // Speech is almost always above -35 dB; never let the threshold go higher.
-        let auto_threshold = (noise_db + 12.0).clamp(-60.0, -38.0);
-        let threshold = if gate.auto { auto_threshold } else { gate.threshold_db };
-        let now = Instant::now();
-        if db >= threshold {
-            open_until = Some(now + GATE_HOLD);
-        }
-        // Without a meter there's no gate: the mic is always on.
-        let open = meter.is_none() || open_until.is_some_and(|t| now < t);
-        let want = open && !shared.muted.load(Ordering::Relaxed);
-        if want != mic_on {
-            mic.set_enabled(want);
-            mic_on = want;
-        }
+            // The level comes from the separate meter; WebRTC's value is 0 while the track is off.
+            let level = meter.as_ref().map(|m| m.take_level()).unwrap_or(me as f32);
+            let db = level_db(level);
+            if tick % 100 == 0 {
+                log::info!("ses: ölçer seviyesi {level:.3} ({db:.0} dB)");
+            }
+            let gate = *shared.gate.lock();
+            // Noise floor: follows quiet levels down quickly; rises only very slowly, and
+            // even more slowly while we're talking. So long speech isn't mistaken for
+            // "noise" that would push the threshold up.
+            let speaking_now = open_until.is_some_and(|t| Instant::now() < t);
+            if tick <= 20 {
+                // First second: measure the room's noise directly (lowest level seen).
+                noise_db = if tick == 1 { db } else { noise_db.min(db) };
+            } else if db < noise_db {
+                noise_db += (db - noise_db) * 0.3;
+            } else {
+                // Adapts in ~25 s while quiet, ~2 min while talking.
+                noise_db += (db - noise_db) * if speaking_now { 0.0004 } else { 0.002 };
+            }
+            // Speech is almost always above -35 dB; never let the threshold go higher.
+            let auto_threshold = (noise_db + 12.0).clamp(-60.0, -38.0);
+            let threshold = if gate.auto { auto_threshold } else { gate.threshold_db };
+            let now = Instant::now();
+            if db >= threshold {
+                open_until = Some(now + GATE_HOLD);
+            }
+            // Without a meter there's no gate: the mic is always on.
+            let open = meter.is_none() || open_until.is_some_and(|t| now < t);
+            let want = open && !shared.muted.load(Ordering::Relaxed);
+            if want != mic_on {
+                mic.set_enabled(want);
+                mic_on = want;
+            }
+            (level, mic_on, auto_threshold)
+        };
 
         // Per-user volume
         {
@@ -885,7 +947,7 @@ async fn stats_loop(pc: PeerConnection, mic: RtcAudioTrack, meter: Option<crate:
         {
             let mut lv = shared.levels.lock();
             lv.me = level;
-            lv.transmitting = mic_on;
+            lv.transmitting = transmitting;
             lv.auto_threshold_db = auto_threshold;
             lv.rtt_ms = rtt.map(|r| r as f32).or(lv.rtt_ms);
             lv.peers = peers.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect();
