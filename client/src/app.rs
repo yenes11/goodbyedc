@@ -135,6 +135,9 @@ pub struct App {
     composer: String,
 
     my_voice: Option<MyVoice>,
+    /// (channel id, user ids of the *other* people in our voice channel) as of the
+    /// last update. Compared with the new list to play join/leave sounds.
+    voice_peers: Option<(i64, HashSet<i64>)>,
     /// Voice channel we're currently joining.
     voice_joining: Option<i64>,
     /// Screen sharing is starting/stopping.
@@ -214,6 +217,7 @@ impl App {
             last_content_h: 0.0,
             composer: String::new(),
             my_voice: None,
+            voice_peers: None,
             voice_joining: None,
             screen_busy: false,
             music_busy: false,
@@ -341,6 +345,11 @@ impl App {
                 Event::Server(m) => self.handle_server(m),
                 Event::VoiceJoined { channel_id, session_id, tracks } => {
                     self.voice_joining = None;
+                    // Chime only for a real join, not when the background silently
+                    // reconnects (then we were already in the channel).
+                    if self.my_voice.is_none() {
+                        self.chime(crate::sounds::Sound::Join);
+                    }
                     self.ws(json!({ "t": "voice_join", "channelId": channel_id, "sessionId": session_id,
                         "tracks": tracks, "muted": self.settings.muted, "deafened": self.settings.deafened }));
                     self.my_voice = Some(MyVoice { channel_id, session_id, tracks });
@@ -349,6 +358,7 @@ impl App {
                 Event::VoiceLeft => {
                     // The background left voice by itself (rejoining failed): update the UI too.
                     if self.my_voice.take().is_some() {
+                        self.chime(crate::sounds::Sound::Leave);
                         self.ws(json!({ "t": "voice_leave" }));
                         self.watching = None;
                         self.screen_tex = None;
@@ -554,6 +564,7 @@ impl App {
                 if usage.is_some() {
                     self.usage = usage;
                 }
+                self.peer_sounds();
                 self.sync_voice();
             }
             ServerMsg::VoiceDisabled { error } => {
@@ -623,6 +634,7 @@ impl App {
 
     fn leave_voice(&mut self) {
         if self.my_voice.take().is_some() {
+            self.chime(crate::sounds::Sound::Leave);
             self.backend.voice(VoiceCmd::Leave);
             self.ws(json!({ "t": "voice_leave" }));
         }
@@ -633,6 +645,47 @@ impl App {
         if matches!(self.modal, Some(Modal::ScreenShare { .. } | Modal::AudioShare { .. })) {
             self.modal = None;
         }
+    }
+
+    /// Plays a notification sound, unless we're deafened (then we don't want to
+    /// hear anything from the app).
+    fn chime(&self, sound: crate::sounds::Sound) {
+        if !self.settings.deafened {
+            crate::sounds::play(sound);
+        }
+    }
+
+    /// Compares who is in our voice channel now with the previous update and
+    /// plays a join/leave sound when someone else came or went.
+    ///
+    /// People are compared by *user id*, not session id: when someone's app
+    /// reconnects in the background their session id changes, but that isn't a
+    /// real leave + join and shouldn't make a sound.
+    fn peer_sounds(&mut self) {
+        let Some(my) = &self.my_voice else {
+            self.voice_peers = None;
+            return;
+        };
+        let me = self.me.as_ref().map(|u| u.id);
+        let now: HashSet<i64> = self
+            .voice
+            .iter()
+            .filter(|v| v.channel_id == my.channel_id && Some(v.user_id) != me)
+            .map(|v| v.user_id)
+            .collect();
+        // Only compare within the same channel; right after we join, the first
+        // list is just remembered (our own join already played a sound).
+        if let Some((channel, before)) = &self.voice_peers {
+            if *channel == my.channel_id {
+                // `difference` = items in the first set that aren't in the second.
+                if now.difference(before).next().is_some() {
+                    self.chime(crate::sounds::Sound::Join);
+                } else if before.difference(&now).next().is_some() {
+                    self.chime(crate::sounds::Sound::Leave);
+                }
+            }
+        }
+        self.voice_peers = Some((my.channel_id, now));
     }
 
     /// Tells the voice loop who is in our voice channel (and whose screen we watch),

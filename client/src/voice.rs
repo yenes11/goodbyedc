@@ -287,6 +287,12 @@ impl Call {
         // mic would be opened twice. Playout (hearing others) always goes through it.
         factory.set_adm_recording_enabled(mic_proc.is_none());
         factory.set_adm_playout_enabled(true);
+        // Windows: play on the default (console) device instead of the default
+        // communications device, so Windows doesn't lower other apps' volume
+        // (see `ducking::default_render_id`).
+        if let Ok(Some(id)) = tokio::task::spawn_blocking(crate::ducking::default_render_id).await {
+            use_playout_device(&factory, &id);
+        }
         let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
         log_devices(&factory);
 
@@ -785,6 +791,22 @@ async fn view_screen(shared: Arc<Shared>, owner: String, track: RtcVideoTrack) {
         *shared.frame.lock() = Some(ScreenFrame { owner: owner.clone(), width, height, rgba });
         shared.request_repaint();
     }
+}
+
+/// Switches WebRTC's speaker output to the device with endpoint id `id`.
+/// WebRTC refuses to change the device while playout is running, so if it
+/// already runs it's stopped, switched and restarted.
+fn use_playout_device(factory: &PeerConnectionFactory, id: &str) {
+    let running = factory.playout_is_initialized();
+    if running {
+        factory.stop_playout();
+    }
+    let ok = factory.set_playout_device_by_guid(id);
+    if running {
+        factory.init_playout();
+        factory.start_playout();
+    }
+    log::info!("hoparlör: varsayılan aygıt seçildi ({ok})");
 }
 
 /// Logs the audio devices WebRTC sees (helps debugging on friends' machines).

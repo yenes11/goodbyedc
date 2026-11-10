@@ -63,3 +63,41 @@ pub fn disable() {
 /// Non-Windows: nothing to do.
 #[cfg(not(windows))]
 pub fn disable() {}
+
+/// Windows: the id of the default *console* speaker device (what Windows calls
+/// "Default Device", as opposed to "Default Communication Device").
+///
+/// Why this matters: WebRTC plays incoming voices on the default
+/// *communications* device. Windows treats any stream on that device as a call
+/// and then lowers every other app (Spotify, games, ...). `SetDuckingPreference`
+/// in `disable()` only stops *our* sound from being lowered, not others. Playing
+/// on the console default device instead avoids the trigger altogether.
+/// voice.rs passes this id to WebRTC (`set_playout_device_by_guid`); WebRTC's
+/// Windows audio code uses the same endpoint id strings as device "guids".
+#[cfg(windows)]
+pub fn default_render_id() -> Option<String> {
+    use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED};
+
+    // Same fresh-thread trick as in `disable` (keeps COM setup off tokio's threads).
+    std::thread::spawn(|| unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        // `GetId` returns a wide (UTF-16) string allocated by COM; we copy it into
+        // a Rust `String` and then must free the original with `CoTaskMemFree`.
+        let pwstr = device.GetId().ok()?;
+        let id = pwstr.to_string().ok();
+        CoTaskMemFree(Some(pwstr.0 as *const _));
+        id
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+/// Non-Windows: no communications/console distinction; keep WebRTC's default.
+#[cfg(not(windows))]
+pub fn default_render_id() -> Option<String> {
+    None
+}

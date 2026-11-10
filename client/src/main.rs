@@ -10,6 +10,7 @@
 //   - config.rs    : settings saved on disk (login token, volumes, ...).
 //   - theme.rs / widgets.rs : colors, fonts and custom-drawn UI pieces.
 //   - micproc.rs  : our mic pipeline (capture → RNNoise noise removal → voice gate).
+//   - sounds.rs   : join/leave chimes for the voice channel.
 //   - screen.rs, appaudio.rs, meter.rs, mictest.rs, normalize.rs, ducking.rs :
 //     screen capture, app-audio capture and other audio helpers.
 //   - preview.rs   : link previews in chat. update.rs : self-update from GitHub.
@@ -30,6 +31,7 @@ mod config;
 mod ducking;
 mod meter;
 mod micproc;
+mod sounds;
 mod mictest;
 mod normalize;
 mod preview;
