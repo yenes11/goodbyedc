@@ -986,8 +986,8 @@ impl App {
     fn sidebar(&mut self, ui: &mut Ui) {
         // Top part: window buttons (macOS) and the window drag area
         let top = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(SIDEBAR_W, BAR));
+        // No line under the top part: the sidebar is one continuous surface.
         widgets::drag_region(ui, top, "sidebar-drag");
-        ui.painter().hline(top.x_range(), top.bottom() - 0.5, Stroke::new(1.0, BORDER));
         ui.add_space(BAR);
 
         // Bottom parts are laid out first; the channel list uses the remaining space.
