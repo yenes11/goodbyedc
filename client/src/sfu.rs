@@ -185,17 +185,27 @@ impl Sfu {
         Ok(())
     }
 
-    /// The SFU reports errors inside a successful (HTTP 200) response, either for
-    /// the whole call or per track. Turn those into real errors.
+    /// The SFU reports errors inside a successful (HTTP 200) response. An error
+    /// for the whole call becomes a real error here. Errors of single tracks
+    /// stay in the response (see `TracksResponse::track_error`): the response
+    /// can still carry an offer that must be answered, and skipping that answer
+    /// would leave the session stuck waiting for it, failing every later call.
     fn check(r: TracksResponse) -> Result<TracksResponse> {
         if let Some(code) = &r.error_code {
             bail!("SFU hatası: {code} {}", r.error_description.clone().unwrap_or_default());
         }
-        for t in &r.tracks {
-            if let Some(code) = &t.error_code {
-                bail!("SFU track hatası: {code} {}", t.error_description.clone().unwrap_or_default());
-            }
-        }
         Ok(r)
+    }
+}
+
+impl TracksResponse {
+    /// The first per-track error in the response, as text (`None` = all fine).
+    pub fn track_error(&self) -> Option<String> {
+        let t = self.tracks.iter().find(|t| t.error_code.is_some())?;
+        Some(format!(
+            "SFU track hatası: {} {}",
+            t.error_code.clone().unwrap_or_default(),
+            t.error_description.clone().unwrap_or_default()
+        ))
     }
 }

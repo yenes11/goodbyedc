@@ -136,14 +136,6 @@ pub struct Shared {
     pub volumes: Mutex<HashMap<String, f32>>,
     /// mid -> remote audio track (to set its volume, mute it, ...).
     pub audio_tracks: Mutex<HashMap<String, RtcAudioTrack>>,
-    /// mids of audio tracks that haven't received data for a while (stalled).
-    pub stalled: Mutex<HashSet<String>>,
-    /// The WebRTC connection's state and when it entered that state.
-    pub pc_state: Mutex<Option<(PeerConnectionState, Instant)>>,
-    /// Set by the stats loop when audio stopped flowing although the connection
-    /// still claims to be fine (the reason, for the log). The voice loop then
-    /// rebuilds the whole call, exactly what leaving and rejoining by hand did.
-    pub dead: Mutex<Option<&'static str>>,
     /// mid -> remote session id (to know whose audio/video a track is).
     pub mid_owner: Mutex<HashMap<String, String>>,
     /// mid -> screen-viewing task.
@@ -162,6 +154,29 @@ impl Shared {
             ctx.request_repaint();
         }
     }
+}
+
+/// The health of *one* call, written by WebRTC's callbacks and the stats loop
+/// and read by the voice loop.
+///
+/// Every `Call` gets its own `Health`. It used to live in `Shared`, which all
+/// calls share: a callback or stats loop left over from an earlier call (for
+/// example one whose join failed half-way) then kept reporting *its* dead
+/// connection there, and the new, healthy call was torn down and rebuilt over
+/// and over until the app was restarted.
+#[derive(Default)]
+struct Health {
+    /// The WebRTC connection's state and when it entered that state.
+    pc_state: Mutex<Option<(PeerConnectionState, Instant)>>,
+    /// Set by the stats loop when audio stopped flowing although the connection
+    /// still claims to be fine (the reason, for the log). The voice loop then
+    /// rebuilds the whole call, exactly what leaving and rejoining by hand did.
+    dead: Mutex<Option<&'static str>>,
+    /// mids of audio tracks that haven't received data for a while (stalled).
+    stalled: Mutex<HashSet<String>>,
+    /// Set by the stats loop when audio arrives but the speaker stopped
+    /// playing it (see the playout watchdog there); `heal` restarts the speaker.
+    playout_stuck: AtomicBool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -210,16 +225,36 @@ pub struct Call {
     last_sync: (Vec<Participant>, Option<String>),
     /// When we last re-pulled a stalled track (avoids re-pulling too often).
     repulled: HashMap<String, Instant>,
-    /// mids of tracks we couldn't close on the SFU yet (muted; closing is retried).
-    zombies: HashSet<String>,
+    /// mids of tracks we couldn't close on the SFU yet (muted), with the number
+    /// of attempts so far; closing is retried a few times during maintenance.
+    zombies: HashMap<String, u32>,
+    /// Pulled tracks whose owner vanished from the participant list, and when.
+    /// They're only closed after `GONE_GRACE` (see `sync`).
+    gone: HashMap<String, Instant>,
+    /// Tracks we keep failing to pull: key -> (failures in a row, first failure).
+    pull_fails: HashMap<String, (u32, Instant)>,
     shared: Arc<Shared>,
+    health: Arc<Health>,
     stats_task: JoinHandle<()>,
     /// When this call was created (a connection that never comes up is "broken" too).
     joined_at: Instant,
     /// Endpoint id of the speaker we play on (Windows), to notice when the
     /// default device changes (headphones plugged in, Bluetooth connected...).
     playout_id: Option<String>,
+    /// Tests only: the task feeding silence in place of a microphone.
+    #[cfg(test)]
+    silent_mic: JoinHandle<()>,
 }
+
+/// How long a pulled track is kept after its owner disappeared from the
+/// participant list. The list comes over the WebSocket, the audio over WebRTC:
+/// when someone's WebSocket reconnects (a short network hiccup, a server
+/// restart) they drop out of the list for a moment although their audio never
+/// stopped. Closing their track right away cut them off for everyone until the
+/// list caught up again; now a short absence isn't audible at all.
+const GONE_GRACE: Duration = Duration::from_secs(6);
+/// How many times closing a track on the SFU is retried before giving up.
+const ZOMBIE_TRIES: u32 = 5;
 
 fn offer_options() -> OfferOptions {
     // The defaults (`Some(false)`) would disable the receive-only tracks we pull;
@@ -241,6 +276,10 @@ impl Call {
     /// Joins voice: sets up the PeerConnection and the audio devices, creates an SFU
     /// session and publishes our microphone. `muted` is the initial mute state.
     pub async fn join(factory: PeerConnectionFactory, sfu: Sfu, shared: Arc<Shared>, muted: bool) -> Result<Self> {
+        // The SFU session comes first: it's the step that fails while the network
+        // is down, and failing here costs nothing (no devices were opened yet).
+        let session_id = sfu.new_session().await?;
+
         let mut config = RtcConfiguration::default();
         config.ice_servers = sfu.ice_servers().await.unwrap_or_else(|e| {
             log::warn!("ICE sunucuları alınamadı, sadece STUN: {e}");
@@ -252,14 +291,12 @@ impl Call {
         });
         let pc = factory.create_peer_connection(config).map_err(|e| anyhow!("{e}"))?;
 
-        *shared.pc_state.lock() = None;
-        *shared.dead.lock() = None;
-        shared.stalled.lock().clear();
+        let health = Arc::new(Health::default());
         {
-            let shared = shared.clone();
+            let health = health.clone();
             pc.on_connection_state_change(Some(Box::new(move |s| {
                 log::info!("bağlantı durumu: {s:?}");
-                *shared.pc_state.lock() = Some((s, Instant::now()));
+                *health.pc_state.lock() = Some((s, Instant::now()));
             })));
         }
         {
@@ -274,8 +311,11 @@ impl Call {
 
         // Real microphone/speakers (the platform ADM, including echo cancellation).
         if !factory.acquire_platform_adm() {
+            pc.close();
             return Err(anyhow!("Ses aygıtı başlatılamadı"));
         }
+        // From here to the creation of the `Call` below nothing may return early:
+        // only `Call`'s `Drop` gives the audio devices back.
         shared.muted.store(muted, Ordering::Relaxed);
 
         // Preferred path: capture the mic ourselves and clean it with RNNoise
@@ -289,6 +329,7 @@ impl Call {
             0,
         );
         // `start` waits for the device to open, so run it on the blocking pool.
+        #[cfg(not(test))]
         let mic_proc = {
             let (src, sh) = (mic_source.clone(), shared.clone());
             tokio::task::spawn_blocking(move || crate::micproc::MicPipeline::start(src, sh))
@@ -296,9 +337,13 @@ impl Call {
                 .ok()
                 .flatten()
         };
+        // Tests have no microphone permission: they send silence instead.
+        #[cfg(test)]
+        let (mic_proc, silent_mic) = (None::<crate::micproc::MicPipeline>, spawn(silence(mic_source.clone())));
+        let use_source = cfg!(test) || mic_proc.is_some();
         // WebRTC records the microphone only in the fallback case; otherwise the
         // mic would be opened twice. Playout (hearing others) always goes through it.
-        factory.set_adm_recording_enabled(mic_proc.is_none());
+        factory.set_adm_recording_enabled(!use_source);
         factory.set_adm_playout_enabled(true);
         // Windows: play on the default (console) device instead of the default
         // communications device, so Windows doesn't lower other apps' volume
@@ -310,8 +355,7 @@ impl Call {
         let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
         log_devices(&factory);
 
-        let session_id = sfu.new_session().await?;
-        let mic = if mic_proc.is_some() {
+        let mic = if use_source {
             log::info!("mikrofon: RNNoise hattı kullanılıyor");
             factory.create_audio_track("mic", mic_source)
         } else {
@@ -325,7 +369,7 @@ impl Call {
         // Fallback only: measure the mic level separately (WebRTC doesn't measure
         // while the track is disabled). `spawn_blocking` runs the blocking
         // `Meter::start` on a thread meant for blocking work.
-        let meter = if mic_proc.is_none() {
+        let meter = if !use_source {
             let m = tokio::task::spawn_blocking(crate::meter::Meter::start).await.ok().flatten();
             if m.is_none() {
                 log::warn!("mikrofon ölçer yok: giriş hassasiyeti devre dışı, mikrofon hep açık");
@@ -335,7 +379,8 @@ impl Call {
             None
         };
         let proc_state = mic_proc.as_ref().map(|p| p.state.clone());
-        let stats_task = spawn(stats_loop(pc.clone(), mic.clone(), meter, proc_state, shared.clone()));
+        let stats_task =
+            spawn(stats_loop(pc.clone(), mic.clone(), meter, proc_state, shared.clone(), health.clone()));
         let call = Self {
             sfu,
             factory,
@@ -349,8 +394,13 @@ impl Call {
             pulled: HashMap::new(),
             last_sync: (Vec::new(), None),
             repulled: HashMap::new(),
-            zombies: HashSet::new(),
+            zombies: HashMap::new(),
+            gone: HashMap::new(),
+            pull_fails: HashMap::new(),
             shared,
+            health,
+            #[cfg(test)]
+            silent_mic,
             stats_task,
             joined_at: Instant::now(),
             playout_id,
@@ -361,6 +411,24 @@ impl Call {
         let mic_enc = RtpEncodingParameters { priority: Priority::High, ..Default::default() };
         let tr = call.add_send_transceiver(MediaStreamTrack::Audio(mic), vec![mic_enc])?;
         call.push_track(&tr, "mic").await.context("mikrofon gönderilemedi")?;
+        // Wait until the connection is really up before reporting success. The
+        // caller announces us to the channel right after this, and everyone then
+        // pulls our microphone at once; if our audio isn't flowing yet, the SFU
+        // keeps each of them waiting ~8 s and then refuses ("no track data").
+        let started = Instant::now();
+        loop {
+            match *call.health.pc_state.lock() {
+                Some((PeerConnectionState::Connected, _)) => break,
+                Some((PeerConnectionState::Failed | PeerConnectionState::Closed, _)) => {
+                    return Err(anyhow!("bağlantı kurulamadı"));
+                }
+                _ if started.elapsed() > Duration::from_secs(15) => {
+                    return Err(anyhow!("bağlantı 15 sn içinde kurulamadı"));
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         Ok(call)
     }
 
@@ -382,7 +450,18 @@ impl Call {
     }
 
     /// Publishes a local transceiver to the SFU under the name `name` ("mic", "screen", "music").
+    /// If it fails, the half-made offer is undone and the transceiver stopped,
+    /// so the connection is left exactly as it was.
     async fn push_track(&self, tr: &RtpTransceiver, name: &str) -> Result<String> {
+        let res = self.push_track_inner(tr, name).await;
+        if res.is_err() {
+            self.rollback().await;
+            let _ = tr.stop();
+        }
+        res
+    }
+
+    async fn push_track_inner(&self, tr: &RtpTransceiver, name: &str) -> Result<String> {
         let offer = self.pc.create_offer(offer_options()).await.map_err(|e| anyhow!("{e}"))?;
         self.pc.set_local_description(offer.clone()).await.map_err(|e| anyhow!("{e}"))?;
         let mid = tr.mid().ok_or_else(|| anyhow!("transceiver mid yok"))?;
@@ -396,13 +475,36 @@ impl Call {
                 }),
             )
             .await?;
+        if let Some(e) = res.track_error() {
+            return Err(anyhow!(e));
+        }
         let answer = res.session_description.ok_or_else(|| anyhow!("SFU answer göndermedi"))?;
         self.pc.set_remote_description(parse(&answer)?).await.map_err(|e| anyhow!("{e}"))?;
         Ok(mid)
     }
 
+    /// Takes back an offer of ours that never got its answer (the request to the
+    /// SFU failed or timed out). Without this the connection stays in the
+    /// "waiting for an answer" state, in which it refuses every offer from the
+    /// SFU: from then on nobody new could be pulled (heard) until rejoining.
+    async fn rollback(&self) {
+        if self.pc.signaling_state() != SignalingState::HaveLocalOffer {
+            return;
+        }
+        let undone = match SessionDescription::parse("", SdpType::Rollback) {
+            Ok(rb) => self.pc.set_local_description(rb).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = undone {
+            // Can't be repaired in place: let the voice loop rebuild the call.
+            log::warn!("yarım kalan teklif geri alınamadı: {e}");
+            *self.health.dead.lock() = Some("sinyalleşme takıldı");
+        }
+    }
+
     /// Answers an offer the SFU sent (renegotiation initiated by the SFU).
     async fn answer_offer(&self, offer: &Sdp) -> Result<()> {
+        self.rollback().await;
         self.pc.set_remote_description(parse(offer)?).await.map_err(|e| anyhow!("{e}"))?;
         let answer = self.pc.create_answer(AnswerOptions::default()).await.map_err(|e| anyhow!("{e}"))?;
         self.pc.set_local_description(answer.clone()).await.map_err(|e| anyhow!("{e}"))?;
@@ -421,25 +523,37 @@ impl Call {
                 json!({ "tracks": [{ "location": "remote", "sessionId": remote_session, "trackName": track }] }),
             )
             .await?;
-        let mid = res
-            .tracks
-            .first()
-            .and_then(|t| t.mid.clone())
-            .ok_or_else(|| anyhow!("SFU track mid döndürmedi"))?;
+        // Answer the SFU's offer first, even if the track itself failed: an
+        // unanswered offer blocks the session for every later request.
+        // (A failed track comes back with an empty mid.)
+        let mid = res.tracks.first().and_then(|t| t.mid.clone()).filter(|m| !m.is_empty());
         // Record the owner before `on_track` fires. Music gets its own owner key
         // ("session#music"), so it doesn't light the speaking ring and its volume is separate.
-        let owner = if track == "music" { music_owner(remote_session) } else { remote_session.to_string() };
-        self.shared.mid_owner.lock().insert(mid.clone(), owner);
+        if let Some(mid) = &mid {
+            let owner = if track == "music" { music_owner(remote_session) } else { remote_session.to_string() };
+            self.shared.mid_owner.lock().insert(mid.clone(), owner);
+        }
+        let mut result = Ok(());
         if res.requires_immediate_renegotiation {
             if let Some(offer) = &res.session_description {
-                if let Err(e) = self.answer_offer(offer).await {
-                    // Half-finished pull: if it stays open on the SFU, the next attempt would make
-                    // us hear this person twice. Mute and close it now; if closing fails it's retried later.
-                    self.drop_mid(&mid).await;
-                    return Err(e);
-                }
+                result = self.answer_offer(offer).await;
             }
         }
+        if let (Ok(()), Some(e)) = (&result, res.track_error()) {
+            result = Err(anyhow!(e));
+        }
+        let mid = match (result, mid) {
+            (Ok(()), Some(mid)) => mid,
+            (Ok(()), None) => return Err(anyhow!("SFU track mid döndürmedi")),
+            (Err(e), mid) => {
+                // Half-finished pull: if it stays open on the SFU, the next attempt would make
+                // us hear this person twice. Mute and close it now; if closing fails it's retried later.
+                if let Some(mid) = mid {
+                    self.drop_mid(&mid).await;
+                }
+                return Err(e);
+            }
+        };
         self.pulled.insert(format!("{remote_session}/{track}"), mid);
         Ok(())
     }
@@ -462,8 +576,14 @@ impl Call {
         }
         self.shared.mid_owner.lock().remove(mid);
         if let Err(e) = self.close_mid(mid).await {
-            log::warn!("track kapatılamadı ({mid}), sonra yeniden denenecek: {e:#}");
-            self.zombies.insert(mid.to_string());
+            let tries = self.zombies.entry(mid.to_string()).or_insert(0);
+            *tries += 1;
+            if *tries >= ZOMBIE_TRIES {
+                log::warn!("track kapatılamadı ({mid}), vazgeçildi: {e:#}");
+                self.zombies.remove(mid);
+            } else {
+                log::warn!("track kapatılamadı ({mid}), sonra yeniden denenecek: {e:#}");
+            }
         } else {
             self.zombies.remove(mid);
         }
@@ -479,6 +599,11 @@ impl Call {
             if sd.kind == "offer" {
                 self.answer_offer(sd).await?;
             }
+        }
+        // A per-track error means the SFU doesn't have (or already closed) this
+        // track: nothing is left to close, so retrying would never succeed.
+        if let Some(e) = res.track_error() {
+            log::debug!("track zaten kapalı ({mid}): {e}");
         }
         Ok(())
     }
@@ -505,20 +630,55 @@ impl Call {
         }
         let desired_keys: HashSet<String> = desired.iter().map(|(s, t)| format!("{s}/{t}")).collect();
 
+        // Tracks we pull but no longer want. If the owner is still in the channel
+        // (they stopped sharing, or we stopped watching) the track is closed right
+        // away. If the owner vanished from the list, it's kept for `GONE_GRACE`
+        // first: they may just be reconnecting their WebSocket (see `GONE_GRACE`).
+        // `heal` calls `sync` every few seconds, which is what ends the grace.
+        let present: HashSet<&str> = participants.iter().map(|p| p.session_id.as_str()).collect();
         let stale: Vec<String> = self.pulled.keys().filter(|k| !desired_keys.contains(*k)).cloned().collect();
+        self.gone.retain(|k, _| stale.contains(k));
         for key in stale {
+            let owner = key.split('/').next().unwrap_or_default();
+            if !present.contains(owner) {
+                let since = *self.gone.entry(key.clone()).or_insert_with(Instant::now);
+                if since.elapsed() < GONE_GRACE {
+                    continue;
+                }
+            }
+            self.gone.remove(&key);
             if let Err(e) = self.unpull(&key).await {
                 log::warn!("track kapatılamadı {key}: {e:#}");
             }
         }
+        self.pull_fails.retain(|k, _| desired_keys.contains(k));
         for (sid, track) in desired {
-            if self.pulled.contains_key(&format!("{sid}/{track}")) {
+            let key = format!("{sid}/{track}");
+            if self.pulled.contains_key(&key) {
                 continue;
             }
-            if let Err(e) = self.pull(&sid, &track).await {
-                log::warn!("track çekilemedi {sid}/{track}: {e:#}");
+            match self.pull(&sid, &track).await {
+                Ok(()) => {
+                    self.pull_fails.remove(&key);
+                }
+                Err(e) => {
+                    log::warn!("track çekilemedi {key}: {e:#}");
+                    self.pull_fails.entry(key).or_insert((0, Instant::now())).0 += 1;
+                }
             }
         }
+    }
+
+    /// Tracks of people in the channel that we've been failing to pull for a
+    /// while (at least 5 attempts over 20 s). Usually that means *our* session
+    /// is stuck, and only a rebuilt call hears them again; the voice loop
+    /// decides (it rebuilds at most once per track, in case the fault is theirs).
+    pub fn failing_pulls(&self) -> Vec<String> {
+        self.pull_fails
+            .iter()
+            .filter(|(_, (n, since))| *n >= 5 && since.elapsed() > Duration::from_secs(20))
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// Is the call broken, so it has to be rebuilt? Returns the reason (for the
@@ -527,12 +687,13 @@ impl Call {
     /// - the connection never came up (still new/connecting 20 s after joining);
     /// - the stats loop saw our audio stop flowing (see `Shared::dead`).
     pub fn broken_reason(&self) -> Option<&'static str> {
-        if let Some(reason) = *self.shared.dead.lock() {
+        if let Some(reason) = *self.health.dead.lock() {
             return Some(reason);
         }
         let slow = Duration::from_secs(20);
-        match *self.shared.pc_state.lock() {
+        match *self.health.pc_state.lock() {
             Some((PeerConnectionState::Failed, _)) => Some("bağlantı başarısız"),
+            Some((PeerConnectionState::Closed, _)) => Some("bağlantı kapandı"),
             Some((PeerConnectionState::Disconnected, t)) if t.elapsed() > Duration::from_secs(8) => {
                 Some("bağlantı 8 sn'dir kopuk")
             }
@@ -557,8 +718,20 @@ impl Call {
                 self.playout_id = Some(id);
             }
         }
+        // Audio arrives but the speaker stopped playing it (the output device
+        // hiccuped, the audio service restarted, the computer woke from sleep...):
+        // restart playback. Before, this silence lasted until rejoining.
+        if self.health.playout_stuck.swap(false, Ordering::Relaxed) {
+            log::warn!("ses geliyor ama hoparlör çalmıyor, çalma yeniden başlatılıyor");
+            self.factory.stop_playout();
+            if let Some(id) = &self.playout_id {
+                self.factory.set_playout_device_by_guid(id);
+            }
+            self.factory.init_playout();
+            self.factory.start_playout();
+        }
         // Retry closing tracks the SFU didn't close earlier.
-        let zombies: Vec<String> = self.zombies.iter().cloned().collect();
+        let zombies: Vec<String> = self.zombies.keys().cloned().collect();
         for mid in zombies {
             self.drop_mid(&mid).await;
         }
@@ -570,7 +743,7 @@ impl Call {
             log::warn!("sahipsiz ses track'i kapatılıyor: {mid}");
             self.drop_mid(&mid).await;
         }
-        let stalled: Vec<String> = self.shared.stalled.lock().drain().collect();
+        let stalled: Vec<String> = self.health.stalled.lock().drain().collect();
         for mid in stalled {
             let Some(key) = self.pulled.iter().find(|(_, m)| **m == mid).map(|(k, _)| k.clone()) else { continue };
             if self.repulled.get(&key).is_some_and(|t| t.elapsed() < Duration::from_secs(15)) {
@@ -756,6 +929,17 @@ impl Call {
     /// Stops a local stream and closes it on the SFU.
     async fn stop_local(&mut self, transceiver: RtpTransceiver, mid: String) -> Result<()> {
         transceiver.stop().map_err(|e| anyhow!("{e}"))?;
+        let res = self.close_local(&mid).await;
+        if res.is_err() {
+            // Don't leave our offer hanging (see `rollback`), and let maintenance
+            // retry closing the track on the SFU.
+            self.rollback().await;
+            self.zombies.entry(mid).or_insert(0);
+        }
+        res
+    }
+
+    async fn close_local(&self, mid: &str) -> Result<()> {
         let offer = self.pc.create_offer(offer_options()).await.map_err(|e| anyhow!("{e}"))?;
         self.pc.set_local_description(offer.clone()).await.map_err(|e| anyhow!("{e}"))?;
         let res = self
@@ -769,10 +953,11 @@ impl Call {
                 }),
             )
             .await?;
-        if let Some(sd) = &res.session_description {
-            if sd.kind == "answer" {
+        match &res.session_description {
+            Some(sd) if sd.kind == "answer" => {
                 self.pc.set_remote_description(parse(sd)?).await.map_err(|e| anyhow!("{e}"))?;
             }
+            _ => return Err(anyhow!("SFU answer göndermedi")),
         }
         Ok(())
     }
@@ -792,13 +977,26 @@ impl Call {
 
     /// Leaves the voice channel. Takes `self` by value (not `&self`), so the `Call`
     /// is consumed: after `leave()` the caller can't use it anymore — the compiler
-    /// enforces that.
-    pub fn leave(mut self) {
+    /// enforces that. The actual cleanup is in `Drop` below.
+    pub fn leave(self) {}
+}
+
+/// Runs whenever a `Call` goes away, however that happens: `leave()`, a join
+/// that failed half-way, the app closing. Doing the cleanup here (it used to be
+/// in `leave`) guarantees it's never skipped. A failed join used to leave its
+/// stats loop running and its audio devices held forever.
+impl Drop for Call {
+    fn drop(&mut self) {
         self.stats_task.abort();
+        #[cfg(test)]
+        self.silent_mic.abort();
         self.screen = None; // dropping the Capture stops screen capturing
         if let Some(m) = self.music.take() {
             m.pacer.abort();
         }
+        // No more callbacks from this connection into the shared state.
+        self.pc.on_track(None);
+        self.pc.on_connection_state_change(None);
         for (_, h) in self.shared.viewers.lock().drain() {
             h.abort();
         }
@@ -809,6 +1007,22 @@ impl Call {
         self.shared.request_repaint();
         self.pc.close();
         self.factory.release_platform_adm();
+    }
+}
+
+/// Tests only: stands in for the microphone by sending silence.
+#[cfg(test)]
+async fn silence(source: NativeAudioSource) {
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        tick.tick().await;
+        let frame = AudioFrame {
+            data: vec![0i16; 480].into(),
+            sample_rate: crate::micproc::RATE,
+            num_channels: 1,
+            samples_per_channel: 480,
+        };
+        let _ = source.capture_frame(&frame).await;
     }
 }
 
@@ -909,6 +1123,7 @@ async fn stats_loop(
     meter: Option<crate::meter::Meter>,
     proc_state: Option<Arc<crate::micproc::MicState>>,
     shared: Arc<Shared>,
+    health: Arc<Health>,
 ) {
     use libwebrtc::stats::RtcStats;
     let mut tick: u32 = 0;
@@ -925,6 +1140,10 @@ async fn stats_loop(
     // any track last received new data.
     let mut prev_in: HashMap<String, u64> = HashMap::new();
     let mut any_inbound = Instant::now();
+    // Speaker watchdog: when any track last received data, and the number of
+    // samples handed to the speaker so far with the time it last grew.
+    let mut last_receiving: Option<Instant> = None;
+    let mut played: (u64, Instant) = (0, Instant::now());
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         tick += 1;
@@ -934,6 +1153,7 @@ async fn stats_loop(
 
         let mut me = 0.0f64;
         let mut sent = 0u64;
+        let mut emitted = 0u64;
         let mut rtt: Option<f64> = None;
         let mut peers = serde_json::Map::new();
         let mut recv = serde_json::Map::new();
@@ -952,6 +1172,7 @@ async fn stats_loop(
                 }
                 RtcStats::InboundRtp(i) if i.stream.kind == "audio" => {
                     bytes_now.insert(i.inbound.mid.clone(), i.inbound.bytes_received);
+                    emitted += i.inbound.jitter_buffer_emitted_count;
                     if let Some(owner) = owners.get(&i.inbound.mid) {
                         peers.insert(owner.clone(), json!(i.inbound.audio_level));
                         recv.insert(owner.clone(), json!(i.inbound.bytes_received));
@@ -969,7 +1190,7 @@ async fn stats_loop(
                 if e.0 != *bytes {
                     *e = (*bytes, now);
                 } else if now.duration_since(e.1) > Duration::from_secs(6) && owners.contains_key(mid) {
-                    shared.stalled.lock().insert(mid.clone());
+                    health.stalled.lock().insert(mid.clone());
                     e.1 = now;
                 }
             }
@@ -980,14 +1201,14 @@ async fn stats_loop(
         // longer flows, which before needed leaving and rejoining by hand.
         {
             let now = Instant::now();
-            let connected = matches!(*shared.pc_state.lock(), Some((PeerConnectionState::Connected, _)));
+            let connected = matches!(*health.pc_state.lock(), Some((PeerConnectionState::Connected, _)));
             // 1) We send nothing. While our mic track is on, WebRTC sends a packet
             //    every 20 ms even in silence, so a byte count that stops growing
             //    means our outgoing audio is stuck and nobody hears us.
             if sent != out_bytes.0 || !mic_on || !connected {
                 out_bytes = (sent, now);
             } else if now.duration_since(out_bytes.1) > Duration::from_secs(8) {
-                *shared.dead.lock() = Some("giden ses 8 sn'dir akmıyor");
+                *health.dead.lock() = Some("giden ses 8 sn'dir akmıyor");
             }
             // 2) We receive nothing from anyone. With 2+ people sending to us, all
             //    of them stalling at once points at our own connection, so the whole
@@ -1000,11 +1221,26 @@ async fn stats_loop(
             if receiving || bytes_now.len() < 2 || !connected {
                 any_inbound = now;
             } else if now.duration_since(any_inbound) > Duration::from_secs(12) {
-                *shared.dead.lock() = Some("12 sn'dir kimseden ses gelmiyor");
+                *health.dead.lock() = Some("12 sn'dir kimseden ses gelmiyor");
+            }
+            // 3) The speaker died. Received audio waits in a buffer until the
+            //    speaker's thread asks for it; `emitted` counts the samples it
+            //    took. Audio keeps arriving but that count stands still = nothing
+            //    is being played, although every other number looks healthy.
+            //    `heal` then restarts playback.
+            if receiving {
+                last_receiving = Some(now);
+            }
+            let arriving = last_receiving.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1));
+            if emitted != played.0 || !arriving {
+                played = (emitted, now);
+            } else if now.duration_since(played.1) > Duration::from_secs(5) {
+                health.playout_stuck.store(true, Ordering::Relaxed);
+                played.1 = now + Duration::from_secs(5); // give the restart time
             }
         }
         if tick % 100 == 0 {
-            log::info!("ses: mikrofon seviyesi {me:.3}, açık {mic_on}, gönderilen {sent} B, alınan {recv:?}, seviyeler {peers:?}");
+            log::info!("ses: mikrofon seviyesi {me:.3}, açık {mic_on}, gönderilen {sent} B, alınan {recv:?}, çalınan {emitted} örnek, seviyeler {peers:?}");
         }
 
         // Input sensitivity (voice gate)
@@ -1081,5 +1317,159 @@ async fn stats_loop(
             lv.peers = peers.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? as f32))).collect();
         }
         shared.request_repaint();
+    }
+}
+
+/// Live tests against the real server (need a saved login and a microphone).
+/// Run with: `cargo test live_ -- --ignored --nocapture`
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// One runtime for all tests: `set_runtime` keeps the first handle it gets,
+    /// so background tasks would otherwise land on an earlier test's dead runtime.
+    fn setup() -> Option<(&'static tokio::runtime::Runtime, Sfu)> {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let _ = env_logger::Builder::new().parse_filters("goodbyedc=info").is_test(false).try_init();
+        let token = crate::config::Settings::load().token?;
+        let rt = RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
+        set_runtime(rt.handle().clone());
+        Some((rt, Sfu::new(&crate::config::server_url(), &token)))
+    }
+
+    /// Joining and leaving twice in a row must be quick and never hang.
+    #[test]
+    #[ignore]
+    fn live_join_leave_timing() {
+        let Some((rt, sfu)) = setup() else { return };
+        rt.block_on(async {
+            let factory = PeerConnectionFactory::default();
+            for round in 0..2 {
+                let t = Instant::now();
+                let call = Call::join(factory.clone(), sfu.clone(), Arc::new(Shared::default()), false).await.unwrap();
+                println!("tur {round}: katılma {:?}", t.elapsed());
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                assert_eq!(call.broken_reason(), None);
+                assert!(call.shared.levels.lock().rtt_ms.is_some(), "istatistik döngüsü çalışmıyor");
+                let t = Instant::now();
+                call.leave();
+                println!("tur {round}: ayrılma {:?}", t.elapsed());
+                assert!(t.elapsed() < Duration::from_secs(3));
+            }
+            assert_eq!(factory.platform_adm_ref_count(), 0);
+        });
+    }
+
+    /// How much we send while unmuted and silent vs. muted.
+    #[test]
+    #[ignore]
+    fn live_muted_bitrate() {
+        let Some((rt, sfu)) = setup() else { return };
+        rt.block_on(async {
+            let factory = PeerConnectionFactory::default();
+            let call = Call::join(factory.clone(), sfu, Arc::new(Shared::default()), false).await.unwrap();
+            async fn sent(pc: &PeerConnection) -> (u64, u64) {
+                let mut out = (0, 0);
+                for st in pc.get_stats().await.unwrap() {
+                    if let libwebrtc::stats::RtcStats::OutboundRtp(o) = st {
+                        out = (o.sent.bytes_sent, o.sent.packets_sent);
+                    }
+                }
+                out
+            }
+            for muted in [false, true, false, true] {
+                call.set_muted(muted);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let a = sent(&call.pc).await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                let b = sent(&call.pc).await;
+                println!("sessizde={muted}: {} kbps, {} paket/sn", (b.0 - a.0) * 8 / 4000, (b.1 - a.1) / 4);
+                assert!((b.1 - a.1) / 4 >= 40, "ses paketleri akmıyor");
+            }
+        });
+    }
+
+    /// A join that fails half-way must give everything back, and must not be
+    /// able to mark a later call as dead.
+    #[test]
+    #[ignore]
+    fn live_failed_join_cleans_up() {
+        let Some((rt, sfu)) = setup() else { return };
+        rt.block_on(async {
+            let factory = PeerConnectionFactory::default();
+            let bad = Sfu::new("http://127.0.0.1:9", "x");
+            assert!(Call::join(factory.clone(), bad, Arc::new(Shared::default()), false).await.is_err());
+            assert_eq!(factory.platform_adm_ref_count(), 0);
+            let call = Call::join(factory.clone(), sfu, Arc::new(Shared::default()), false).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            assert_eq!(call.broken_reason(), None);
+        });
+    }
+
+    /// Two calls: B hears A. Checks pulling, the speaker counter, the grace
+    /// period for vanished participants and recovery from a failed negotiation.
+    #[test]
+    #[ignore]
+    fn live_pull_grace_and_rollback() {
+        let Some((rt, sfu)) = setup() else { return };
+        rt.block_on(async {
+            let factory = PeerConnectionFactory::default();
+            let a = Call::join(factory.clone(), sfu.clone(), Arc::new(Shared::default()), false).await.unwrap();
+            let mut b = Call::join(factory.clone(), sfu.clone(), Arc::new(Shared::default()), false).await.unwrap();
+            let pa = Participant { session_id: a.session_id.clone(), tracks: vec!["mic".into()] };
+            let key = format!("{}/mic", a.session_id);
+
+            // A request to the SFU fails in the middle of a negotiation...
+            let good = std::mem::replace(&mut b.sfu, Sfu::new("http://127.0.0.1:9", "x"));
+            let src = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 0);
+            let tr = b
+                .add_send_transceiver(MediaStreamTrack::Audio(factory.create_audio_track("x", src)), vec![])
+                .unwrap();
+            assert!(b.push_track(&tr, "x").await.is_err());
+            assert_eq!(b.pc.signaling_state(), SignalingState::Stable);
+            b.sfu = good;
+
+            // ...and pulling still works afterwards.
+            b.sync(&[pa.clone()], None).await;
+            assert!(b.pulled.contains_key(&key), "A çekilemedi");
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let stats = b.pc.get_stats().await.unwrap();
+            let (mut bytes, mut emitted) = (0, 0);
+            for st in &stats {
+                if let libwebrtc::stats::RtcStats::InboundRtp(i) = st {
+                    bytes += i.inbound.bytes_received;
+                    emitted += i.inbound.jitter_buffer_emitted_count;
+                }
+            }
+            println!("alınan {bytes} B, çalınan {emitted} örnek");
+            assert!(bytes > 0 && emitted > 48_000, "ses akmıyor ya da çalınmıyor");
+            assert!(!b.health.playout_stuck.load(Ordering::Relaxed));
+            assert!(b.health.stalled.lock().is_empty());
+
+            // A muted person still sends (silent) packets, so they can be pulled.
+            let c = Call::join(factory.clone(), sfu.clone(), Arc::new(Shared::default()), true).await.unwrap();
+            let pc_ = Participant { session_id: c.session_id.clone(), tracks: vec!["mic".into()] };
+            let t = Instant::now();
+            b.sync(&[pa.clone(), pc_], None).await;
+            println!("sessizdeki kişiyi çekme {:?}", t.elapsed());
+            assert!(b.pulled.contains_key(&format!("{}/mic", c.session_id)), "sessizdeki kişi çekilemedi");
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            assert!(b.health.stalled.lock().is_empty(), "sessizdeki kişi 'takıldı' sayıldı");
+            drop(c);
+
+            // A drops out of the list for a moment: still pulled.
+            b.sync(&[], None).await;
+            assert!(b.pulled.contains_key(&key));
+            b.sync(&[pa.clone()], None).await;
+            assert!(!b.gone.contains_key(&key));
+            // A is gone for good: closed after the grace period.
+            b.sync(&[], None).await;
+            tokio::time::sleep(GONE_GRACE + Duration::from_millis(200)).await;
+            b.heal().await;
+            assert!(!b.pulled.contains_key(&key));
+            assert!(b.zombies.is_empty());
+            assert_eq!(a.broken_reason(), None);
+            assert_eq!(b.broken_reason(), None);
+        });
     }
 }

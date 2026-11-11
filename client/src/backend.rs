@@ -366,6 +366,8 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
     // attempt dropped us out of the channel.
     let mut rejoining: Option<std::time::Instant> = None;
     const GIVE_UP: Duration = Duration::from_secs(120);
+    // Tracks whose failing pulls already caused one rebuild (see step 1 below).
+    let mut blamed: std::collections::HashSet<String> = Default::default();
 
     loop {
         let (token, cmd) = tokio::select! {
@@ -375,7 +377,18 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
             },
             _ = tick.tick() => {
                 // 1) Is the current call broken? Then tear it down; step 2 rebuilds it.
-                if let Some(reason) = call.as_ref().and_then(|c| c.broken_reason()) {
+                let mut reason = call.as_ref().and_then(|c| c.broken_reason());
+                // Someone in the channel can't be pulled, again and again: our
+                // session is probably stuck, so rebuild. Only once per track: if
+                // the fault is on their side, rebuilding again wouldn't help.
+                if let (None, Some(c)) = (reason, &call) {
+                    let failing = c.failing_pulls();
+                    if failing.iter().any(|k| !blamed.contains(k)) {
+                        blamed.extend(failing);
+                        reason = Some("kanaldaki birinin sesi alınamıyor");
+                    }
+                }
+                if let Some(reason) = reason {
                     log::warn!("ses bağlantısı koptu ({reason}), yeniden katılınıyor");
                     if let Some(old) = call.take() {
                         old.leave();
@@ -417,6 +430,7 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
         match cmd {
             VoiceCmd::Join { channel_id, muted, deafened } => {
                 rejoining = None;
+                blamed.clear();
                 if let Some(old) = call.take() {
                     old.leave();
                 }
@@ -438,6 +452,7 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
             VoiceCmd::Leave => {
                 current = None;
                 rejoining = None;
+                blamed.clear();
                 if let Some(c) = call.take() {
                     c.leave();
                     sink.send(Event::VoiceLeft);

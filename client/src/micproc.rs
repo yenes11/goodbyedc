@@ -156,7 +156,7 @@ fn mic_thread(tx: mpsc::UnboundedSender<Msg>, ready_tx: std::sync::mpsc::Sender<
         let alive = Arc::new(AtomicU32::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         match open(tx.clone(), alive.clone(), failed.clone()) {
-            Ok((stream, rate)) => {
+            Ok((stream, rate, name)) => {
                 let _ = tx.send(Msg::Rate(rate));
                 if first {
                     let _ = ready_tx.send(true);
@@ -164,8 +164,21 @@ fn mic_thread(tx: mpsc::UnboundedSender<Msg>, ready_tx: std::sync::mpsc::Sender<
                 }
                 let mut last_count = 0;
                 let mut last_change = std::time::Instant::now();
+                let mut device_checked = std::time::Instant::now();
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(100));
+                    // Follow the system's default microphone: when a headset is
+                    // plugged in (or Bluetooth connects) the default changes, but
+                    // the open stream keeps recording from the old device. Before,
+                    // the new microphone was only used after rejoining.
+                    if device_checked.elapsed() > Duration::from_secs(2) {
+                        device_checked = std::time::Instant::now();
+                        let now = default_input_name();
+                        if now.is_some() && now != name {
+                            log::info!("varsayılan mikrofon değişti ({now:?}), oraya geçiliyor");
+                            break;
+                        }
+                    }
                     let count = alive.load(Ordering::Relaxed);
                     if count != last_count {
                         last_count = count;
@@ -223,6 +236,15 @@ async fn process(
     let mut cleaned = vec![0.0f32; FRAME];
     // When the last microphone data arrived (to tell "mic is dead" from "late").
     let mut last_data = std::time::Instant::now();
+    // Guard against a device that delivers audio faster than real time (seen
+    // with a misbehaving driver: 17 times too much). Everything we're given is
+    // sent, so the others would receive hundreds of packets per second from us,
+    // which breaks their playback of our voice. `budget` is how many 48 kHz
+    // samples we may still accept: it refills at 1.1x real time, holds at most
+    // a quarter second, and chunks that don't fit are dropped.
+    let mut budget: f64 = RATE as f64 / 4.0;
+    let mut budget_at = std::time::Instant::now();
+    let mut flood_logged = false;
 
     loop {
         // Wait for the next message, but at most 50 ms. `timeout` returns
@@ -241,7 +263,23 @@ async fn process(
             }
             Ok(Some(Msg::Data(chunk))) => {
                 last_data = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                budget = (budget + now.duration_since(budget_at).as_secs_f64() * RATE as f64 * 1.1)
+                    .min(RATE as f64 / 4.0);
+                budget_at = now;
+                let before = pending.len();
                 resampler.push(&chunk, &mut pending);
+                let added = (pending.len() - before) as f64;
+                if added > budget {
+                    // Doesn't fit: drop this chunk and keep saving up for the next.
+                    if !flood_logged {
+                        log::warn!("mikrofon gerçek zamandan hızlı veri veriyor, fazlası atılıyor");
+                        flood_logged = true;
+                    }
+                    pending.truncate(before);
+                    continue;
+                }
+                budget -= added;
                 // If we ever fall behind, don't let the delay grow: keep at most
                 // 60 ms of unprocessed audio and drop the oldest beyond that.
                 let max = FRAME * 6;
@@ -343,17 +381,25 @@ impl Resampler {
     }
 }
 
-/// Opens the default input device. Returns the stream and its sample rate.
+/// Name of the system's current default microphone (`None` if there is none
+/// or it can't be read).
+fn default_input_name() -> Option<String> {
+    cpal::default_host().default_input_device()?.name().ok()
+}
+
+/// Opens the default input device. Returns the stream, its sample rate and the
+/// device's name.
 /// Every callback downmixes to mono -1..1 floats and sends the chunk to `tx`.
 fn open(
     tx: mpsc::UnboundedSender<Msg>,
     alive: Arc<AtomicU32>,
     failed: Arc<AtomicBool>,
-) -> anyhow::Result<(cpal::Stream, u32)> {
+) -> anyhow::Result<(cpal::Stream, u32, Option<String>)> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or_else(|| anyhow::anyhow!("mikrofon yok"))?;
     let config = device.default_input_config()?;
-    log::info!("mikrofon: {} ({:?})", device.name().unwrap_or_default(), config);
+    let name = device.name().ok();
+    log::info!("mikrofon: {} ({:?})", name.clone().unwrap_or_default(), config);
     let rate = config.sample_rate().0;
     let channels = config.channels() as usize;
     let fmt = config.sample_format();
@@ -372,7 +418,7 @@ fn open(
     // On other systems `disable` does nothing.
     crate::ducking::disable();
     stream.play()?;
-    Ok((stream, rate))
+    Ok((stream, rate, name))
 }
 
 /// Builds the input stream for one sample type `T`.
