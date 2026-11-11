@@ -984,11 +984,19 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
-        // Top part: window buttons (macOS) and the window drag area
-        let top = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(SIDEBAR_W, BAR));
-        // No line under the top part: the sidebar is one continuous surface.
-        widgets::drag_region(ui, top, "sidebar-drag");
-        ui.add_space(BAR);
+        // Top part. On macOS the window buttons (red/yellow/green) sit here, so
+        // the sidebar keeps an empty, draggable strip of the top bar's height.
+        // On Windows those buttons are on the right of the header instead, so the
+        // strip would just be empty space: the channel list starts right at the top
+        // (the header still lets you drag the window).
+        if IS_MAC {
+            let top = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(SIDEBAR_W, BAR));
+            // No line under the top part: the sidebar is one continuous surface.
+            widgets::drag_region(ui, top, "sidebar-drag");
+            ui.add_space(BAR);
+        } else {
+            ui.add_space(4.0);
+        }
 
         // Bottom parts are laid out first; the channel list uses the remaining space.
         // The sections' top separator lines span the sidebar's full width.
