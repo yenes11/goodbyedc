@@ -16,6 +16,8 @@
 //!   - Renegotiation: exchanging new SDPs when tracks are added/removed.
 //!   - ICE servers: STUN/TURN servers that help connect through firewalls/NAT.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Result};
 use libwebrtc::prelude::IceServer;
 use serde::{Deserialize, Serialize};
@@ -92,7 +94,14 @@ impl Sfu {
     /// because the struct must own its data.
     pub fn new(base: &str, token: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Time limits: without them a request sent just as the network dropped
+            // could wait for minutes, and since the voice loop handles everything
+            // in order, the whole call (pulls, repairs, even leaving) waited with it.
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
         }

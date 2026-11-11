@@ -274,16 +274,27 @@ async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<Stri
     let mut retry: u32 = 0;
     loop {
         sink.send(Event::Conn(if retry == 0 { Conn::Connecting } else { Conn::Reconnecting }));
-        match tokio_tungstenite::connect_async(&url).await {
+        // At most 10 s for the connection to open (otherwise retry with backoff).
+        let attempt = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(&url))
+            .await
+            .unwrap_or_else(|_| Err(tungstenite::Error::Io(std::io::ErrorKind::TimedOut.into())));
+        match attempt {
             Ok((stream, _)) => {
                 retry = 0;
                 sink.send(Event::Conn(Conn::Connected));
                 // Split the socket into a writing half and a reading half so both can be used in the loop.
                 let (mut write, mut read) = stream.split();
-                let mut ping = tokio::time::interval(Duration::from_secs(30));
-                // Send "ping" every 30 s so proxies don't close an idle connection.
+                let mut ping = tokio::time::interval(Duration::from_secs(15));
+                // Send "ping" every 15 s so proxies don't close an idle connection.
                 // (The first tick of an interval fires immediately; consume it here.)
                 ping.tick().await;
+                // When we last heard anything from the server. The server answers
+                // every ping with "pong", so silence for 45 s means the connection
+                // is dead even if the operating system hasn't noticed (e.g. the
+                // Wi-Fi dropped for a moment). Without this check such a dead
+                // connection could linger for minutes: the server and the others
+                // no longer saw our voice state, so audio stopped until rejoining.
+                let mut last_heard = std::time::Instant::now();
                 loop {
                     // `select!` waits on several futures at once and runs the branch of whichever
                     // finishes first: an incoming message, an outgoing message from the UI, or the
@@ -291,6 +302,7 @@ async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<Stri
                     tokio::select! {
                         msg = read.next() => match msg {
                             Some(Ok(WsMessage::Text(t))) => {
+                                last_heard = std::time::Instant::now();
                                 if t.as_str() == "pong" {
                                     continue;
                                 }
@@ -311,7 +323,13 @@ async fn ws_loop(base: String, token: String, mut out_rx: UnboundedReceiver<Stri
                             None => return,
                         },
                         _ = ping.tick() => {
-                            let _ = write.send(WsMessage::Text("ping".into())).await;
+                            if last_heard.elapsed() > Duration::from_secs(45) {
+                                log::warn!("sunucudan 45 sn'dir yanıt yok, yeniden bağlanılıyor");
+                                break;
+                            }
+                            if write.send(WsMessage::Text("ping".into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -342,6 +360,12 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
     let mut current: Option<(i64, String)> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // While the call is being rebuilt after a break: when we started trying.
+    // We keep retrying (every tick) for up to `GIVE_UP`, because the network is
+    // often down for a while (Wi-Fi reconnecting); before, a single failed
+    // attempt dropped us out of the channel.
+    let mut rejoining: Option<std::time::Instant> = None;
+    const GIVE_UP: Duration = Duration::from_secs(120);
 
     loop {
         let (token, cmd) = tokio::select! {
@@ -350,11 +374,17 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
                 None => break,
             },
             _ = tick.tick() => {
-                let broken = call.as_ref().is_some_and(|c| c.is_broken());
-                if broken {
-                    if let (Some(old), Some((channel_id, token))) = (call.take(), current.clone()) {
-                        log::warn!("ses bağlantısı koptu, yeniden katılınıyor");
+                // 1) Is the current call broken? Then tear it down; step 2 rebuilds it.
+                if let Some(reason) = call.as_ref().and_then(|c| c.broken_reason()) {
+                    log::warn!("ses bağlantısı koptu ({reason}), yeniden katılınıyor");
+                    if let Some(old) = call.take() {
                         old.leave();
+                    }
+                    rejoining = Some(std::time::Instant::now());
+                }
+                // 2) No call but we should be in a channel: (re)build it.
+                if call.is_none() {
+                    if let (Some(started), Some((channel_id, token))) = (rejoining, current.clone()) {
                         let muted = shared.muted.load(std::sync::atomic::Ordering::Relaxed);
                         let deafened = shared.deafened.load(std::sync::atomic::Ordering::Relaxed);
                         match Call::join(factory.clone(), Sfu::new(&base, &token), shared.clone(), muted).await {
@@ -364,10 +394,15 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
                                 sink.send(Event::VoiceJoined { channel_id, session_id: c.session_id.clone(), tracks });
                                 sink.toast("Ses bağlantısı koptu, yeniden bağlanıldı", false);
                                 call = Some(c);
+                                rejoining = None;
+                            }
+                            Err(e) if started.elapsed() < GIVE_UP => {
+                                log::warn!("yeniden katılınamadı, tekrar denenecek: {e:#}");
                             }
                             Err(e) => {
-                                log::warn!("yeniden katılınamadı: {e:#}");
+                                log::warn!("yeniden katılınamadı, vazgeçiliyor: {e:#}");
                                 current = None;
+                                rejoining = None;
                                 sink.toast("Ses bağlantısı koptu, yeniden bağlanılamadı", true);
                                 sink.send(Event::VoiceLeft);
                             }
@@ -381,6 +416,7 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
         };
         match cmd {
             VoiceCmd::Join { channel_id, muted, deafened } => {
+                rejoining = None;
                 if let Some(old) = call.take() {
                     old.leave();
                 }
@@ -401,6 +437,7 @@ async fn voice_loop(base: String, mut rx: UnboundedReceiver<(String, VoiceCmd)>,
             }
             VoiceCmd::Leave => {
                 current = None;
+                rejoining = None;
                 if let Some(c) = call.take() {
                     c.leave();
                     sink.send(Event::VoiceLeft);

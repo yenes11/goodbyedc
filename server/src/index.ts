@@ -80,6 +80,8 @@ interface Attachment {
   userId: number;
   username: string;
   voice: VoiceInfo | null;
+  /** When the socket connected (ms); counts as its first sign of life. */
+  since?: number;
 }
 
 const MAX_MESSAGE_LEN = 4000;
@@ -96,6 +98,10 @@ const SCREEN_BPS = 3_300_000;
 const MUSIC_BPS = 140_000;
 const WINDOW_DAYS = 31;
 const USAGE_TICK_MS = 60_000;
+// Clients send "ping" every 30 s. A socket silent for this long is a dead
+// connection the platform hasn't noticed yet (e.g. the client's network dropped
+// and it reconnected on a new socket); it must not keep showing up in voice.
+const STALE_MS = 90_000;
 const LIMIT_MSG = "Son 31 günün ücretsiz trafik sınırına ulaşıldı. Sesli sohbet geçici olarak kapalı.";
 
 /**
@@ -333,7 +339,10 @@ export class Hub extends DurableObject<Env> {
     const [client, server] = [pair[0], pair[1]];
     // Hibernatable WebSocket: the DO may sleep while the socket stays open.
     this.ctx.acceptWebSocket(server);
-    const att: Attachment = { userId: user.id, username: user.username, voice: null };
+    // Close dead sockets first so a reconnecting user's old, frozen socket
+    // doesn't linger in the voice list next to the new one.
+    const prunedVoice = this.pruneStale();
+    const att: Attachment = { userId: user.id, username: user.username, voice: null, since: Date.now() };
     server.serializeAttachment(att);
 
     server.send(JSON.stringify({
@@ -346,12 +355,26 @@ export class Hub extends DurableObject<Env> {
       usage: this.usageInfo(),
     }));
     this.broadcast({ t: "presence", online: this.onlineUsers() });
+    // A dead socket was dropped from voice: tell everyone the new voice list.
+    if (prunedVoice) void this.broadcastVoice();
     return new Response(null, { status: 101, webSocket: client });
   }
 
   /** Handles one message from a client (chat message, history request, voice updates...). */
   async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
     if (typeof raw !== "string") return;
+    // Normally the runtime answers "ping" by itself (setWebSocketAutoResponse);
+    // this is a fallback so a client always gets its "pong". The client treats
+    // 45 s without any reply as a dead connection and reconnects.
+    if (raw === "ping") {
+      ws.send("pong");
+      const a = ws.deserializeAttachment() as Attachment | null;
+      if (a) {
+        a.since = Date.now();
+        ws.serializeAttachment(a);
+      }
+      return;
+    }
     let msg: any;
     try {
       msg = JSON.parse(raw);
@@ -458,6 +481,17 @@ export class Hub extends DurableObject<Env> {
           watching: null,
         };
         ws.serializeAttachment(att);
+        // One voice slot per user: if another socket of this user is still marked
+        // as in voice (an old connection after a network drop, or a second copy of
+        // the app), clear it so the user doesn't appear twice.
+        for (const s of this.ctx.getWebSockets()) {
+          if (s === ws) continue;
+          const a = s.deserializeAttachment() as Attachment | null;
+          if (a?.voice && a.userId === att.userId) {
+            a.voice = null;
+            s.serializeAttachment(a);
+          }
+        }
         await this.broadcastVoice();
         return;
       }
@@ -504,7 +538,33 @@ export class Hub extends DurableObject<Env> {
   }
 
   sockets(exclude?: WebSocket): WebSocket[] {
-    return this.ctx.getWebSockets().filter((s) => s !== exclude && s.readyState === WebSocket.OPEN);
+    return this.ctx
+      .getWebSockets()
+      .filter((s) => s !== exclude && s.readyState === WebSocket.OPEN && !this.isStale(s));
+  }
+
+  /** True if the socket hasn't pinged for STALE_MS (see STALE_MS). */
+  isStale(s: WebSocket): boolean {
+    const a = s.deserializeAttachment() as Attachment | null;
+    const pinged = this.ctx.getWebSocketAutoResponseTimestamp(s)?.getTime() ?? 0;
+    const last = Math.max(pinged, a?.since ?? 0);
+    // Sockets from before `since` existed: only judge them by their pings.
+    if (last === 0) return false;
+    return Date.now() - last > STALE_MS;
+  }
+
+  /** Closes dead sockets; returns true if any of them was in voice. */
+  pruneStale(): boolean {
+    let hadVoice = false;
+    for (const s of this.ctx.getWebSockets()) {
+      if (!this.isStale(s)) continue;
+      const a = s.deserializeAttachment() as Attachment | null;
+      if (a?.voice) hadVoice = true;
+      try {
+        s.close(1001, "zaman aşımı");
+      } catch {}
+    }
+    return hadVoice;
   }
 
   /** Everyone currently in a voice channel (read from all sockets' attachments). */
@@ -535,8 +595,9 @@ export class Hub extends DurableObject<Env> {
 
   /** Runs once a minute: record accumulated traffic, check the limit. */
   async alarm(): Promise<void> {
+    const pruned = this.pruneStale();
     await this.updateUsage();
-    if (this.voiceState().length) {
+    if (pruned || this.voiceState().length) {
       this.broadcast({ t: "voice", voice: this.voiceState(), usage: this.usageInfo() });
     }
   }
@@ -588,7 +649,10 @@ export class Hub extends DurableObject<Env> {
       newRate = 0;
     }
     this.setKV("usage_rate", String(newRate));
-    if (newRate > 0 && (await this.ctx.storage.getAlarm()) === null) {
+    // Keep the minute tick running while anyone is in voice (even alone, when the
+    // rate is 0) so dead sockets get pruned from the voice list.
+    const active = newRate > 0 || this.voiceState(exclude).length > 0;
+    if (active && (await this.ctx.storage.getAlarm()) === null) {
       await this.ctx.storage.setAlarm(now + USAGE_TICK_MS);
     }
     this.sql.exec("DELETE FROM usage_daily WHERE day < ?", dayOffset(-40));

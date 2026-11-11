@@ -140,6 +140,10 @@ pub struct Shared {
     pub stalled: Mutex<HashSet<String>>,
     /// The WebRTC connection's state and when it entered that state.
     pub pc_state: Mutex<Option<(PeerConnectionState, Instant)>>,
+    /// Set by the stats loop when audio stopped flowing although the connection
+    /// still claims to be fine (the reason, for the log). The voice loop then
+    /// rebuilds the whole call, exactly what leaving and rejoining by hand did.
+    pub dead: Mutex<Option<&'static str>>,
     /// mid -> remote session id (to know whose audio/video a track is).
     pub mid_owner: Mutex<HashMap<String, String>>,
     /// mid -> screen-viewing task.
@@ -210,6 +214,11 @@ pub struct Call {
     zombies: HashSet<String>,
     shared: Arc<Shared>,
     stats_task: JoinHandle<()>,
+    /// When this call was created (a connection that never comes up is "broken" too).
+    joined_at: Instant,
+    /// Endpoint id of the speaker we play on (Windows), to notice when the
+    /// default device changes (headphones plugged in, Bluetooth connected...).
+    playout_id: Option<String>,
 }
 
 fn offer_options() -> OfferOptions {
@@ -244,6 +253,7 @@ impl Call {
         let pc = factory.create_peer_connection(config).map_err(|e| anyhow!("{e}"))?;
 
         *shared.pc_state.lock() = None;
+        *shared.dead.lock() = None;
         shared.stalled.lock().clear();
         {
             let shared = shared.clone();
@@ -293,8 +303,9 @@ impl Call {
         // Windows: play on the default (console) device instead of the default
         // communications device, so Windows doesn't lower other apps' volume
         // (see `ducking::default_render_id`).
-        if let Ok(Some(id)) = tokio::task::spawn_blocking(crate::ducking::default_render_id).await {
-            use_playout_device(&factory, &id);
+        let playout_id = tokio::task::spawn_blocking(crate::ducking::default_render_id).await.ok().flatten();
+        if let Some(id) = &playout_id {
+            use_playout_device(&factory, id);
         }
         let _ = tokio::task::spawn_blocking(crate::ducking::disable).await;
         log_devices(&factory);
@@ -341,6 +352,8 @@ impl Call {
             zombies: HashSet::new(),
             shared,
             stats_task,
+            joined_at: Instant::now(),
+            playout_id,
         };
         // Publish our microphone to the SFU as track "mic".
         // Priority High: when the upload is tight (e.g. during screen sharing),
@@ -508,18 +521,42 @@ impl Call {
         }
     }
 
-    /// Is the connection broken (do we need to rejoin)? "Disconnected" for > 8 s also counts.
-    pub fn is_broken(&self) -> bool {
+    /// Is the call broken, so it has to be rebuilt? Returns the reason (for the
+    /// log), or `None` if everything is fine. Broken means any of:
+    /// - WebRTC says the connection failed, or it has been "disconnected" for > 8 s;
+    /// - the connection never came up (still new/connecting 20 s after joining);
+    /// - the stats loop saw our audio stop flowing (see `Shared::dead`).
+    pub fn broken_reason(&self) -> Option<&'static str> {
+        if let Some(reason) = *self.shared.dead.lock() {
+            return Some(reason);
+        }
+        let slow = Duration::from_secs(20);
         match *self.shared.pc_state.lock() {
-            Some((PeerConnectionState::Failed, _)) => true,
-            Some((PeerConnectionState::Disconnected, t)) => t.elapsed() > Duration::from_secs(8),
-            _ => false,
+            Some((PeerConnectionState::Failed, _)) => Some("bağlantı başarısız"),
+            Some((PeerConnectionState::Disconnected, t)) if t.elapsed() > Duration::from_secs(8) => {
+                Some("bağlantı 8 sn'dir kopuk")
+            }
+            Some((PeerConnectionState::New | PeerConnectionState::Connecting, t)) if t.elapsed() > slow => {
+                Some("bağlantı kurulamadı")
+            }
+            None if self.joined_at.elapsed() > slow => Some("bağlantı kurulamadı"),
+            _ => None,
         }
     }
 
     /// Periodic maintenance: closes and re-pulls stalled audio tracks and retries
     /// tracks that couldn't be pulled before.
     pub async fn heal(&mut self) {
+        // Windows: if the default speaker changed (headphones plugged in or out,
+        // Bluetooth connected...), move our playback there. Without this the
+        // others' voices kept going to the old (maybe gone) device until rejoining.
+        if let Ok(Some(id)) = tokio::task::spawn_blocking(crate::ducking::default_render_id).await {
+            if self.playout_id.as_deref() != Some(id.as_str()) {
+                log::info!("varsayılan hoparlör değişti, oraya geçiliyor");
+                use_playout_device(&self.factory, &id);
+                self.playout_id = Some(id);
+            }
+        }
         // Retry closing tracks the SFU didn't close earlier.
         let zombies: Vec<String> = self.zombies.iter().cloned().collect();
         for mid in zombies {
@@ -882,6 +919,12 @@ async fn stats_loop(
     let mut applied: HashMap<String, f32> = HashMap::new();
     // mid -> (bytes received, when that number last changed)
     let mut inbound: HashMap<String, (u64, Instant)> = HashMap::new();
+    // Outgoing audio watchdog: bytes sent so far and when that number last grew.
+    let mut out_bytes: (u64, Instant) = (0, Instant::now());
+    // Incoming audio watchdog: bytes per track at the previous tick, and when
+    // any track last received new data.
+    let mut prev_in: HashMap<String, u64> = HashMap::new();
+    let mut any_inbound = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         tick += 1;
@@ -929,6 +972,35 @@ async fn stats_loop(
                     shared.stalled.lock().insert(mid.clone());
                     e.1 = now;
                 }
+            }
+        }
+        // Whole-call watchdogs. Both only run while the connection reports
+        // "connected": otherwise the connection state itself triggers the rebuild.
+        // They catch the case where WebRTC thinks everything is fine but audio no
+        // longer flows, which before needed leaving and rejoining by hand.
+        {
+            let now = Instant::now();
+            let connected = matches!(*shared.pc_state.lock(), Some((PeerConnectionState::Connected, _)));
+            // 1) We send nothing. While our mic track is on, WebRTC sends a packet
+            //    every 20 ms even in silence, so a byte count that stops growing
+            //    means our outgoing audio is stuck and nobody hears us.
+            if sent != out_bytes.0 || !mic_on || !connected {
+                out_bytes = (sent, now);
+            } else if now.duration_since(out_bytes.1) > Duration::from_secs(8) {
+                *shared.dead.lock() = Some("giden ses 8 sn'dir akmıyor");
+            }
+            // 2) We receive nothing from anyone. With 2+ people sending to us, all
+            //    of them stalling at once points at our own connection, so the whole
+            //    call is rebuilt (one stalled person is handled by re-pulling just
+            //    their track, see `heal`).
+            // "Receiving" = some track's byte count grew since the last tick
+            // (tracks that just appeared or disappeared don't count).
+            let receiving = bytes_now.iter().any(|(mid, b)| prev_in.get(mid).is_some_and(|p| b > p));
+            prev_in = bytes_now.clone();
+            if receiving || bytes_now.len() < 2 || !connected {
+                any_inbound = now;
+            } else if now.duration_since(any_inbound) > Duration::from_secs(12) {
+                *shared.dead.lock() = Some("12 sn'dir kimseden ses gelmiyor");
             }
         }
         if tick % 100 == 0 {
